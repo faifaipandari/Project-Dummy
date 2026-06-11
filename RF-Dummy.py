@@ -30,22 +30,22 @@ X_train, X_test, y_train, y_test = train_test_split(
 # class_weight="balanced" for there being more NC than C.
 rf = RandomForestClassifier(class_weight="balanced", random_state=42)
 param_grid = {
-    "n_estimators":     [200],
-    "max_depth":        [7],
-    "min_samples_leaf": [3],
+    "n_estimators":     [300, 500],
+    "max_depth":        [3, 5, 7],
+    "min_samples_leaf": [1, 3, 5],
+    "max_features": ["sqrt", "log2", None]
 }
 
 # 5. Nested cross-validation (run on the TRAINING set)
-#     Inner 5-fold: grid searches and picks the best hyperparameters
-#     Outer 5-fold: cross validation score
-inner_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-outer_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+#    Inner 5-fold: grid searches and picks the best hyperparameters
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-grid = GridSearchCV(rf, param_grid, cv=inner_cv, scoring="f1_weighted", n_jobs=1, refit=True,
+grid = GridSearchCV(rf, param_grid, cv=cv, scoring="f1_weighted", n_jobs=1, refit=True,
                     verbose=0, pre_dispatch='2*n_jobs', error_score=np.nan, return_train_score=False)
-nested = cross_val_score(grid, X_train, y_train,
-                         cv=outer_cv, scoring="f1_weighted")
-print(f"Nested CV weighted F1: {nested.mean():.3f} ± {nested.std():.3f}")
+# rf = the estimator, param_grid = the hyperparameters to search, cv = the cross-validation strategy used to score each candidate,
+# scoring="f1_weighted" to decide whuch hyperparameter combination is the best using F1 score, n_jobs=-1 to use all the cores,
+# refit=True to refit the best model on the whole training set after grid search, verbose=0 for no output during fitting, pre_dispatch='2*n_jobs'
+# to control how many jobs get dispatched during parallel execution, error_score=np.nan to assign NaN if an error occurs during fitting, return_train_score=False to not return training scores.
 
 # 6. Tune on the full training set, then test on the 30% testing set
 # inner CV picks the best params (from training set)
