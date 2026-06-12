@@ -12,28 +12,34 @@ from sklearn.ensemble import RandomForestClassifier
 import random
 
 
+# 1. Shuffling and splitting patients by patients ID (using all the data points per patient) instead of using the mean value (previous versino of code)
+# Create a function to collapse one patient ID into a list of [[a ,b ,c], [d, e, f], ... [x, y, z]]
 def split(data: pd.DataFrame, training_size: float = 0.7, shuffle: bool = True, random_state: int = 42):
-    patients = {}
-    for index in range(len(data)):
-        pid = data.loc[index, 'pid']
-        if pid not in patients:
-            patients[pid] = []
-        patients[pid].append(index)
+    # Shuffle:bool = True is the setting for the split function (Should I shuffle the patients before splitting them into train and test?)
+    patients = {} # Starts an empty dictionary
+    # The following code block explain the patient-grouping block
+    for index in range(len(data)): # Go through every row, one at a time where index is a row number (0, 1, 2 ...)
+        pid = data.loc[index, 'pid'] # .loc = location, this look up which patient that row belongs to
+        if pid not in patients: # If it's the first time you've seen this patient, give them an empty list to hold their rows
+            patients[pid] = [] # Create an empty list to store the things as the value for the key "pid" in the dictionary
+        patients[pid].append(index) # Add this row's number to that patient's list
 
     patients = list(patients.values())
+    # It throws away the patient-id keys and keeps just the lists of row numbers
+    # Make the list of "patients = [[0, 1, 2], [3, 4, 5], ...]"
     num_patients = len(patients)
     training_num = int(num_patients * training_size)
     testing_num = int(num_patients - training_num)
 
-    # splitting
+    # Splitting the patients
     if shuffle:
-        random.shuffle(patients)
+        random.shuffle(patients) # If shuffling is turned on (it is, by default), randomly reorders the list of patients
     training_patients = patients[:training_num]
     testing_patients = patients[training_num:]
 
-    training_indices = []
+    training_indices = [] # Start an empty list to collect all the training row numbers
     for patient in training_patients:
-        training_indices += patient
+        training_indices += patient # Go through each patient bundle and pours the patient's row numbers into a flat list
     testing_indices = []
     for patient in testing_patients:
         testing_indices += patient
@@ -41,31 +47,30 @@ def split(data: pd.DataFrame, training_size: float = 0.7, shuffle: bool = True, 
     return training_indices, testing_indices
 
 
-# 1. Load data and average the 3 replicates per patient
-#     Each patient has 3 repeated rows. Averaging gives ONE row per patient,
-#     so replicates of the same person can't leak across the split / folds
-#     (which would otherwise make the scores look better than they are).
-df = pd.read_csv("Dummy.csv", dtype={'pid': str})
+# 2. Using the features information to predict C/NC 
+df = pd.read_csv("Dummy.csv")
 features = [f"X_{i}" for i in range(1, 10)]
-
-training_indices, testing_indices = split(df)
-print(len(training_indices), len(testing_indices))
-exit()
-
-
-# 2. Define the features (X) and the label (y), and patient ID (groups)
-X = df[features]
+# Define the features (X) and the label (y), and patient ID (groups)
+X = df[features] # Features
 y = df["cnc"]  # "C" or "NC"
-groups = df["pid"]  # patient ID for grouping in cross-validation
+groups = df["pid"]  # Patient ID for grouping in cross-validation
 
-# 3. 70:30 train/test split (split by patients)
-patient_label = df.groupby("pid")["cnc"].first()  # force one label per patient
-train_pids, test_pids = train_test_split(patient_label.index, test_size=0.3,
-                                         stratify=patient_label.values, random_state=42)
+
+# 3. Split by patient: get the train/test row numbers, then pick out those rows
+training_indices, testing_indices = split(df) # Previous function in step 1.
+# Training data
+X_train = X.loc[training_indices] # Pick out a set of rows from the location of training_indices
+y_train = y.loc[training_indices]
+groups_train = groups.loc[training_indices] # Tag every row with the patient it belongs to
+# Testing data
+X_test = X.loc[testing_indices]
+y_test = y.loc[testing_indices]
+group_test = groups.loc[testing_indices]
+
 
 # 4. Base model + the hyperparameter grid to search
-# class_weight="balanced" for there being more NC than C.
-rf = RandomForestClassifier(class_weight="balanced", random_state=42)
+rf = RandomForestClassifier(class_weight="balanced", random_state=42, n_jobs=-1)
+# class_weight="balanced" for there being more NC than C, n_jobs = -1 means using all cpu cores
 param_grid = {
     "n_estimators":     [300, 500],
     "max_depth":        [3, 5, 7],
@@ -74,41 +79,42 @@ param_grid = {
 }
 
 # 5. Nested cross-validation (run on the TRAINING set)
-#    Inner 5-fold: grid searches and picks the best hyperparameters
-cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+# Inner 5-fold: grid searches and picks the best hyperparameters
+inner_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-grid = GridSearchCV(rf, param_grid, cv=cv,
-                    scoring="f1_weighted", n_jobs=1, refit=True)
+grid = GridSearchCV(rf, param_grid, cv=inner_cv,
+                    scoring="roc_auc", n_jobs=1, refit=True)
 # rf = the estimator, param_grid = the hyperparameters to search, cv = the cross-validation strategy used to score each candidate,
-# scoring="f1_weighted" to decide whuch hyperparameter combination is the best using F1 score, n_jobs=-1 to use all the cores,
-# refit=True to refit the best model on the whole training set after grid search, verbose=0 for no output during fitting, pre_dispatch='2*n_jobs'
-# to control how many jobs get dispatched during parallel execution, error_score=np.nan to assign NaN if an error occurs during fitting, return_train_score=False to not return training scores.
+# scoring="roc_auc" to decide which hyperparameter combination is the best, n_jobs=1 do one job at a time,
+# refit=True to refit the best model on the whole training set after grid search.
 
 # 6. Tune on the full training set, then test on the 30% testing set
 # inner CV picks the best params (from training set)
 grid.fit(X_train, y_train)
+print("="*30)
+print()
 print("Best hyperparameters:", grid.best_params_)
 predicted = grid.best_estimator_.predict(X_test)
 
 # 7. Report performance on the test set
-print(metrics.classification_report(y_test, predicted))
-print(f"Test accuracy: {metrics.accuracy_score(y_test, predicted):.3f}")
+print(metrics.classification_report(y_test, predicted, digits=3))
 
 # 8. Confusion matrix on the test set
 cm = metrics.confusion_matrix(y_test, predicted, labels=["NC", "C"])
-plt.figure(figsize=(6, 4))
-sns.heatmap(cm, annot=True, fmt="d", cmap="coolwarm",
-            xticklabels=["NC", "C"], yticklabels=["NC", "C"])
-plt.title("Random Forest Confusion Matrix")
-plt.xlabel("Predicted")
-plt.ylabel("True")
-plt.tight_layout()
-plt.show()
+cm_df = pd.DataFrame(cm,
+                     index=["True NC", "True C"],
+                     columns=["Predicted NC", "Predicted C"])
+print("\nConfusion matrix:")
+print(cm_df)
+print()
 
 # 9. Dxcover clinical matrics
 # With labels=["NC","C"], the matrix is [[TN, FP], [FN, TP]].
 tn, fp, fn, tp = cm.ravel()
+print("Dxcover clinical matrics:")
 print(f"Sensitivity (recall, C):  {tp/(tp+fn):.3f}")
 print(f"Specificity (recall, NC): {tn/(tn+fp):.3f}")
-print(f"PPV (precision, C):       {tp/(tp+fp):.3f}")
+print(f"PPV:                      {tp/(tp+fp):.3f}")
 print(f"NPV:                      {tn/(tn+fn):.3f}")
+print()
+print("="*30)
