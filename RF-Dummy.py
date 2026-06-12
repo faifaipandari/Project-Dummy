@@ -7,24 +7,61 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from sklearn import metrics
 from sklearn.model_selection import (train_test_split, GridSearchCV,
-                                     StratifiedKFold, cross_val_score)
+                                     StratifiedKFold)
 from sklearn.ensemble import RandomForestClassifier
+import random
+
+
+def split(data: pd.DataFrame, training_size: float = 0.7, shuffle: bool = True, random_state: int = 42):
+    patients = {}
+    for index in range(len(data)):
+        pid = data.loc[index, 'pid']
+        if pid not in patients:
+            patients[pid] = []
+        patients[pid].append(index)
+
+    patients = list(patients.values())
+    num_patients = len(patients)
+    training_num = int(num_patients * training_size)
+    testing_num = int(num_patients - training_num)
+
+    # splitting
+    if shuffle:
+        random.shuffle(patients)
+    training_patients = patients[:training_num]
+    testing_patients = patients[training_num:]
+
+    training_indices = []
+    for patient in training_patients:
+        training_indices += patient
+    testing_indices = []
+    for patient in testing_patients:
+        testing_indices += patient
+
+    return training_indices, testing_indices
+
 
 # 1. Load data and average the 3 replicates per patient
 #     Each patient has 3 repeated rows. Averaging gives ONE row per patient,
 #     so replicates of the same person can't leak across the split / folds
 #     (which would otherwise make the scores look better than they are).
-df = pd.read_csv("Dummy.csv")
+df = pd.read_csv("Dummy.csv", dtype={'pid': str})
 features = [f"X_{i}" for i in range(1, 10)]
-patients = df.groupby(["pid", "cnc"], as_index=False)[features].mean()
 
-# 2. Define the features (X) and the label (y)
-X = patients[features]
-y = patients["cnc"]  # "C" or "NC"
+training_indices, testing_indices = split(df)
+print(len(training_indices), len(testing_indices))
+exit()
 
-# 3. 70:30 train/test split
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.30, random_state=42, stratify=y)  # stratify to keep class balance in train/test
+
+# 2. Define the features (X) and the label (y), and patient ID (groups)
+X = df[features]
+y = df["cnc"]  # "C" or "NC"
+groups = df["pid"]  # patient ID for grouping in cross-validation
+
+# 3. 70:30 train/test split (split by patients)
+patient_label = df.groupby("pid")["cnc"].first()  # force one label per patient
+train_pids, test_pids = train_test_split(patient_label.index, test_size=0.3,
+                                         stratify=patient_label.values, random_state=42)
 
 # 4. Base model + the hyperparameter grid to search
 # class_weight="balanced" for there being more NC than C.
@@ -40,8 +77,8 @@ param_grid = {
 #    Inner 5-fold: grid searches and picks the best hyperparameters
 cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-grid = GridSearchCV(rf, param_grid, cv=cv, scoring="f1_weighted", n_jobs=1, refit=True,
-                    verbose=0, pre_dispatch='2*n_jobs', error_score=np.nan, return_train_score=False)
+grid = GridSearchCV(rf, param_grid, cv=cv,
+                    scoring="f1_weighted", n_jobs=1, refit=True)
 # rf = the estimator, param_grid = the hyperparameters to search, cv = the cross-validation strategy used to score each candidate,
 # scoring="f1_weighted" to decide whuch hyperparameter combination is the best using F1 score, n_jobs=-1 to use all the cores,
 # refit=True to refit the best model on the whole training set after grid search, verbose=0 for no output during fitting, pre_dispatch='2*n_jobs'
