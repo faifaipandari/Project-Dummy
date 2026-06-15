@@ -11,9 +11,10 @@ from sklearn.model_selection import (train_test_split, GridSearchCV,
 from sklearn.ensemble import RandomForestClassifier
 import random
 
-def getFeatures(data: pd.DataFrame, indices: list):
-    x_cols = [col for col in list(data.columns) if col[:2] == 'X_']
-    return data.loc[indices, x_cols]
+def getFeatures(data: pd.DataFrame, indices: list, features = []):
+    if features == []:# Features = x_col, we upgrade this to make sure that we can select the features we want out of the real spectrum
+        features = [col for col in list(data.columns) if col[:2] == 'X_'] # The column name of the features we choose for this dummy dataset
+    return data.loc[indices, features]
 
 def getTarget(data: pd.DataFrame, indices: list, target: str = 'cnc'):
     return data.loc[indices, target]
