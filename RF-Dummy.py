@@ -16,13 +16,17 @@ import random
 # Create a function to collapse one patient ID into a list of [[a ,b ,c], [d, e, f], ... [x, y, z]]
 def split(data: pd.DataFrame, training_size: float = 0.7, shuffle: bool = True, random_state: int = 42):
     # Shuffle:bool = True is the setting for the split function (Should I shuffle the patients before splitting them into train and test?)
-    patients = {} # Starts an empty dictionary
+    patients = {}  # Starts an empty dictionary
     # The following code block explain the patient-grouping block
-    for index in range(len(data)): # Go through every row, one at a time where index is a row number (0, 1, 2 ...)
-        pid = data.loc[index, 'pid'] # .loc = location, this look up which patient that row belongs to
-        if pid not in patients: # If it's the first time you've seen this patient, give them an empty list to hold their rows
-            patients[pid] = [] # Create an empty list to store the things as the value for the key "pid" in the dictionary
-        patients[pid].append(index) # Add this row's number to that patient's list
+    # Go through every row, one at a time where index is a row number (0, 1, 2 ...)
+    for index in range(len(data)):
+        # .loc = location, this look up which patient that row belongs to
+        pid = data.loc[index, 'pid']
+        if pid not in patients:  # If it's the first time you've seen this patient, give them an empty list to hold their rows
+            # Create an empty list to store the things as the value for the key "pid" in the dictionary
+            patients[pid] = []
+        # Add this row's number to that patient's list
+        patients[pid].append(index)
 
     patients = list(patients.values())
     # It throws away the patient-id keys and keeps just the lists of row numbers
@@ -33,13 +37,15 @@ def split(data: pd.DataFrame, training_size: float = 0.7, shuffle: bool = True, 
 
     # Splitting the patients
     if shuffle:
-        random.shuffle(patients) # If shuffling is turned on (it is, by default), randomly reorders the list of patients
+        # If shuffling is turned on (it is, by default), randomly reorders the list of patients
+        random.shuffle(patients)
     training_patients = patients[:training_num]
     testing_patients = patients[training_num:]
 
-    training_indices = [] # Start an empty list to collect all the training row numbers
+    training_indices = []  # Start an empty list to collect all the training row numbers
     for patient in training_patients:
-        training_indices += patient # Go through each patient bundle and pours the patient's row numbers into a flat list
+        # Go through each patient bundle and pours the patient's row numbers into a flat list
+        training_indices += patient
     testing_indices = []
     for patient in testing_patients:
         testing_indices += patient
@@ -47,21 +53,23 @@ def split(data: pd.DataFrame, training_size: float = 0.7, shuffle: bool = True, 
     return training_indices, testing_indices
 
 
-# 2. Using the features information to predict C/NC 
+# 2. Using the features information to predict C/NC
 df = pd.read_csv("Dummy.csv")
 features = [f"X_{i}" for i in range(1, 10)]
 # Define the features (X) and the label (y), and patient ID (groups)
-X = df[features] # Features
+X = df[features]  # Features
 y = df["cnc"]  # "C" or "NC"
 groups = df["pid"]  # Patient ID for grouping in cross-validation
 
 
 # 3. Split by patient: get the train/test row numbers, then pick out those rows
-training_indices, testing_indices = split(df) # Previous function in step 1.
+training_indices, testing_indices = split(df)  # Previous function in step 1.
 # Training data
-X_train = X.loc[training_indices] # Pick out a set of rows from the location of training_indices
+# Pick out a set of rows from the location of training_indices
+X_train = X.loc[training_indices]
 y_train = y.loc[training_indices]
-groups_train = groups.loc[training_indices] # Tag every row with the patient it belongs to
+# Tag every row with the patient it belongs to
+groups_train = groups.loc[training_indices]
 # Testing data
 X_test = X.loc[testing_indices]
 y_test = y.loc[testing_indices]
@@ -69,7 +77,8 @@ group_test = groups.loc[testing_indices]
 
 
 # 4. Base model + the hyperparameter grid to search
-rf = RandomForestClassifier(class_weight="balanced", random_state=42, n_jobs=-1)
+rf = RandomForestClassifier(
+    criterion='gini', class_weight="balanced", random_state=42, n_jobs=-1)
 # class_weight="balanced" for there being more NC than C, n_jobs = -1 means using all cpu cores
 param_grid = {
     "n_estimators":     [300, 500],
@@ -97,7 +106,17 @@ print("Best hyperparameters:", grid.best_params_)
 predicted = grid.best_estimator_.predict(X_test)
 
 # 7. Report performance on the test set
+print()
 print(metrics.classification_report(y_test, predicted, digits=3))
+
+# Gini importance
+best_rf = grid.best_estimator_
+importance_table = pd.DataFrame(
+    {"Importance": best_rf.feature_importances_}, index=features
+)
+print("\nGini importance:")
+print(importance_table.round(3))
+print()
 
 # 8. Confusion matrix on the test set
 cm = metrics.confusion_matrix(y_test, predicted, labels=["NC", "C"])
