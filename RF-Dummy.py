@@ -11,6 +11,12 @@ from sklearn.model_selection import (train_test_split, GridSearchCV,
 from sklearn.ensemble import RandomForestClassifier
 import random
 
+def getFeatures(data: pd.DataFrame, indices: list):
+    x_cols = [col for col in list(data.columns) if col[:2] == 'X_']
+    return data.loc[indices, x_cols]
+
+def getTarget(data: pd.DataFrame, indices: list, target: str = 'cnc'):
+    return data.loc[indices, target]
 
 # 1. Shuffling and splitting patients by patients ID (using all the data points per patient) instead of using the mean value (previous versino of code)
 # Create a function to collapse one patient ID into a list of [[a ,b ,c], [d, e, f], ... [x, y, z]]
@@ -56,24 +62,12 @@ def split(data: pd.DataFrame, training_size: float = 0.7, shuffle: bool = True, 
 # 2. Using the features information to predict C/NC
 df = pd.read_csv("Dummy.csv")
 features = [f"X_{i}" for i in range(1, 10)]
-# Define the features (X) and the label (y), and patient ID (groups)
-X = df[features]  # Features
-y = df["cnc"]  # "C" or "NC"
-groups = df["pid"]  # Patient ID for grouping in cross-validation
 
 
 # 3. Split by patient: get the train/test row numbers, then pick out those rows
 training_indices, testing_indices = split(df)  # Previous function in step 1.
 # Training data
 # Pick out a set of rows from the location of training_indices
-X_train = X.loc[training_indices]
-y_train = y.loc[training_indices]
-# Tag every row with the patient it belongs to
-groups_train = groups.loc[training_indices]
-# Testing data
-X_test = X.loc[testing_indices]
-y_test = y.loc[testing_indices]
-group_test = groups.loc[testing_indices]
 
 
 # 4. Base model + the hyperparameter grid to search
@@ -81,15 +75,15 @@ rf = RandomForestClassifier(
     criterion='gini', class_weight="balanced", random_state=42, n_jobs=-1)
 # class_weight="balanced" for there being more NC than C, n_jobs = -1 means using all cpu cores
 param_grid = {
-    "n_estimators":     [300, 500],
+    "n_estimators":     [500],
     "max_depth":        [3, 5, 7],
     "min_samples_leaf": [1, 3, 5],
     "max_features": ["sqrt", "log2", None]
 }
 
-# 5. Nested cross-validation (run on the TRAINING set)
+# 5. Nested cross-validation (run on the TRAINING set) ## ** wrtie our own K fold function so there will be no data leakage among the same pid **
 # Inner 5-fold: grid searches and picks the best hyperparameters
-inner_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+inner_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42) ## **
 
 grid = GridSearchCV(rf, param_grid, cv=inner_cv,
                     scoring="roc_auc", n_jobs=1, refit=True)
@@ -99,15 +93,14 @@ grid = GridSearchCV(rf, param_grid, cv=inner_cv,
 
 # 6. Tune on the full training set, then test on the 30% testing set
 # inner CV picks the best params (from training set)
-grid.fit(X_train, y_train)
+grid.fit(getFeatures(df, training_indices), getTarget(df, training_indices))
 print("="*30)
 print()
 print("Best hyperparameters:", grid.best_params_)
-predicted = grid.best_estimator_.predict(X_test)
+predicted = grid.best_estimator_.predict(getFeatures(df, testing_indices))
 
 # 7. Report performance on the test set
 print()
-print(metrics.classification_report(y_test, predicted, digits=3))
 
 # Gini importance
 best_rf = grid.best_estimator_
@@ -119,7 +112,7 @@ print(importance_table.round(3))
 print()
 
 # 8. Confusion matrix on the test set
-cm = metrics.confusion_matrix(y_test, predicted, labels=["NC", "C"])
+cm = metrics.confusion_matrix(getTarget(df, testing_indices), predicted, labels=["NC", "C"])
 cm_df = pd.DataFrame(cm,
                      index=["True NC", "True C"],
                      columns=["Predicted NC", "Predicted C"])
