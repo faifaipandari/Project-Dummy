@@ -11,7 +11,7 @@ from sklearn.model_selection import (train_test_split, GridSearchCV,
 from sklearn.ensemble import RandomForestClassifier
 import random
 
-def getFeatures(data: pd.DataFrame, indices: list, features = []):
+def getFeatures(data: pd.DataFrame, indices: list, features = []): # "give me the inputs for these rows"
     if features == []:# Features = x_col, we upgrade this to make sure that we can select the features we want out of the real spectrum
         features = [col for col in list(data.columns) if col[:2] == 'X_'] # The column name of the features we choose for this dummy dataset
     return data.loc[indices, features]
@@ -84,9 +84,52 @@ param_grid = {
 
 # 5. Nested cross-validation (run on the TRAINING set) ## ** wrtie our own K fold function so there will be no data leakage among the same pid **
 # Inner 5-fold: grid searches and picks the best hyperparameters
-inner_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42) ## **
 
-grid = GridSearchCV(rf, param_grid, cv=inner_cv,
+# Build the inputs from the previous steps
+X_train = getFeatures(df, training_indices) # DataFrame of X_1–X_9, index = training_indices
+Y_train = getTarget(df, training_indices) # Series of 'cnc', index = training_indices
+groups  = df.loc[training_indices, 'pid'] # Needed because the function needs to know which patient each row beongs to
+
+def inner_k_fold_cv(X: pd.DataFrame, Y: pd.Series, groups: pd.Series, k: int = 5, shuffle=True, random_state=42):
+    patients = {} # creating an empty dictionary that maps each patient's ID to a list of patient's row
+    for idx in X.index: # looping over every row in X, one row at a time   # FIX: X not X_train (use the argument)
+        pid = groups.loc[idx] # look up which patient this row belongs to   # FIX: do the lookup once
+        if pid not in patients: # if it has not yet seen the patient (new patient), open an empty list for it
+            patients[pid] = [] # create the empty list here
+        patients[pid].append(idx) # add the current row to that patient's list
+    patients = list(patients.values()) # should come out like: [[idx 0, 1, 2], [idx 3, 4, 5], ...] where .values() drops the pid keys
+
+    # setting up the positions to shuffle and slice
+    n_patients = len(patients) # count the number of patients
+    indices = np.arange(n_patients) # make an array of the patient's position on the list
+
+    # shuffle the position of patients in the list
+    if shuffle:
+        np.random.default_rng(random_state).shuffle(indices) # shuffle with reproducible random seed
+    # deciding the fold size
+    folds = np.array_split(indices, k) # split the position (indices), not patients
+
+    splits = [] # prepare an empty list to collect training/testing set per fold
+    for fold_num in range(k):
+        test_patient  = folds[fold_num] # only one fold for test/validation
+        train_patient = [] # create the loop for the rest of the folds to be training set
+        for other_fold in range(k):
+            if other_fold != fold_num: # if it is not the test fold, make them a training set
+                for patient in folds[other_fold]:
+                    train_patient.append(patient)
+
+        # making the folds into list of row numbers
+        test_indices  = []
+        for patient in test_patient:
+            test_indices += patients[patient] # add all of the patient's rows   # FIX: patient is a position → look up patients[patient]
+        train_indices = []
+        for patient in train_patient:
+            train_indices += patients[patient] # same lookup for the training side
+        splits.append((train_indices, test_indices))
+
+    return splits
+
+grid = GridSearchCV(rf, param_grid, cv=inner_k_fold_cv,
                     scoring="roc_auc", n_jobs=1, refit=True)
 # rf = the estimator, param_grid = the hyperparameters to search, cv = the cross-validation strategy used to score each candidate,
 # scoring="roc_auc" to decide which hyperparameter combination is the best, n_jobs=1 do one job at a time,
