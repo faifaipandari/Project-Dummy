@@ -6,8 +6,7 @@ import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
 from sklearn import metrics
-from sklearn.model_selection import (train_test_split, GridSearchCV,
-                                     StratifiedKFold)
+from sklearn.model_selection import (train_test_split, GridSearchCV, StratifiedKFold, PredefinedSplit)
 from sklearn.ensemble import RandomForestClassifier
 import random
 
@@ -82,54 +81,50 @@ param_grid = {
     "max_features": ["sqrt", "log2", None]
 }
 
-# 5. Nested cross-validation (run on the TRAINING set) ## ** wrtie our own K fold function so there will be no data leakage among the same pid **
+# 5. Nested cross-validation (run on the TRAINING set)
 # Inner 5-fold: grid searches and picks the best hyperparameters
 
-# Build the inputs from the previous steps
-X_train = getFeatures(df, training_indices) # DataFrame of X_1–X_9, index = training_indices
-Y_train = getTarget(df, training_indices) # Series of 'cnc', index = training_indices
-groups  = df.loc[training_indices, 'pid'] # Needed because the function needs to know which patient each row beongs to
+# Build the inputs from the previous steps (for cross validation, only pull 70% of the dataset from "training_indices")
+X_train = getFeatures(df, training_indices) # dataFrame of X_1–X_9
+Y_train = getTarget(df, training_indices) # series of 'cnc'
+groups  = df.loc[training_indices, 'pid'] # keep the patients with the same ID together
 
-def inner_k_fold_cv(X: pd.DataFrame, Y: pd.Series, groups: pd.Series, k: int = 5, shuffle=True, random_state=42):
-    patients = {} # creating an empty dictionary that maps each patient's ID to a list of patient's row
-    for idx in X.index: # looping over every row in X, one row at a time   # FIX: X not X_train (use the argument)
-        pid = groups.loc[idx] # look up which patient this row belongs to   # FIX: do the lookup once
+def inner_k_fold_cv(df: pd.DataFrame, indices: list, k: int = 5, shuffle: bool = True, random_state: int = 42):
+    # groupping the roq by patients ID (pid)
+    patients = [] # creating an empty dictionary that maps each patient's ID to a list of patient's row
+    for position, idx in enumerate(getFeatures(df, indices).index): # looping over every position in X, one row at a time (need to be position, not the orginal df label)
+        pid = df.loc[training_indices, 'pid'].loc[idx] # look up which patient this row belongs to   # FIX: do the lookup once
         if pid not in patients: # if it has not yet seen the patient (new patient), open an empty list for it
-            patients[pid] = [] # create the empty list here
-        patients[pid].append(idx) # add the current row to that patient's list
-    patients = list(patients.values()) # should come out like: [[idx 0, 1, 2], [idx 3, 4, 5], ...] where .values() drops the pid keys
+            patients.append(pid)
 
     # setting up the positions to shuffle and slice
     n_patients = len(patients) # count the number of patients
-    indices = np.arange(n_patients) # make an array of the patient's position on the list
 
     # shuffle the position of patients in the list
     if shuffle:
-        np.random.default_rng(random_state).shuffle(indices) # shuffle with reproducible random seed
-    # deciding the fold size
-    folds = np.array_split(indices, k) # split the position (indices), not patients
+        random.seed(random_state)
+        random.shuffle(patients) # shuffle with reproducible random seed
+    
+    pid_folds = {}
+    for fold in range(k):
+        pid_folds[fold] = patients[int((n_patients / k) * fold):int((n_patients / k) * (fold + 1))]
 
-    splits = [] # prepare an empty list to collect training/testing set per fold
-    for fold_num in range(k):
-        test_patient  = folds[fold_num] # only one fold for test/validation
-        train_patient = [] # create the loop for the rest of the folds to be training set
-        for other_fold in range(k):
-            if other_fold != fold_num: # if it is not the test fold, make them a training set
-                for patient in folds[other_fold]:
-                    train_patient.append(patient)
+    folds = []
+    for index in indices:
+        pid = df.loc[index, 'pid']
+        for fold in pid_folds:
+            if pid in pid_folds[fold]:
+                folds.append(fold)
 
-        # making the folds into list of row numbers
-        test_indices  = []
-        for patient in test_patient:
-            test_indices += patients[patient] # add all of the patient's rows   # FIX: patient is a position → look up patients[patient]
-        train_indices = []
-        for patient in train_patient:
-            train_indices += patients[patient] # same lookup for the training side
-        splits.append((train_indices, test_indices))
+    print(len(indices), len(folds))
 
-    return splits
+    return PredefinedSplit(folds)
+    
 
-grid = GridSearchCV(rf, param_grid, cv=inner_k_fold_cv,
+
+# searching the best method
+inner_cv = inner_k_fold_cv(df, training_indices)
+grid = GridSearchCV(rf, param_grid, cv=inner_cv,
                     scoring="roc_auc", n_jobs=1, refit=True)
 # rf = the estimator, param_grid = the hyperparameters to search, cv = the cross-validation strategy used to score each candidate,
 # scoring="roc_auc" to decide which hyperparameter combination is the best, n_jobs=1 do one job at a time,
