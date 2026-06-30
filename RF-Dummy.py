@@ -13,8 +13,13 @@ from sklearn.model_selection import (
 from sklearn.ensemble import RandomForestClassifier
 import random
 
+import json
 
-# "give me the inputs for these rows"
+# ===========================================
+# Inner Loop
+# ===========================================
+
+# "Give me the inputs for these rows"
 def getFeatures(data: pd.DataFrame, indices: list, features=[]):
     if features == []:  # Features = x_col, we upgrade this to make sure that we can select the features we want out of the real spectrum
         # The column name of the features we choose for this dummy dataset
@@ -216,21 +221,26 @@ fpr, tpr, threshold = metrics.roc_curve(
 roc_auc = metrics.auc(fpr, tpr)  # calculate AUC value
 
 # plot ROC curve
-plt.title('Receiver Operating Characteristic')
-plt.plot(fpr, tpr, 'b', label='AUC = %0.2f' % roc_auc)
+plt.title('Receiver Operating Characteristic of the Inner-loop Nested CV')
+plt.plot(fpr, tpr, 'b', label='AUC = %0.6f' % roc_auc)
 plt.legend(loc='lower right')
 plt.plot([0, 1], [0, 1], 'r--')
 plt.xlim([0, 1])
+ax = plt.gca()
+ax.set_xlim(ax.get_xlim()[::-1])
 plt.ylim([0, 1])
 plt.ylabel('True Positive Rate')
 plt.xlabel('False Positive Rate')
-plt.show()
+plt.savefig(f'Receiver_Operating_Characteristic_of_the_Inner-loop_Nested_CV.png')
 print("="*30)
 print()
 
 # ===========================================
 # Outer loop - 51 iterations
-n_runs = 51
+# ===========================================
+
+# Set n = 51 for iterations
+n_runs = 3
 
 # create empty lists to collect each run's results
 acc_list = []
@@ -239,6 +249,8 @@ spec_list = []
 ppv_list = []
 npv_list = []
 auc_list = []
+
+tr_metrics = {'acc': [], 'sens': [], 'spec': [], 'ppv': [], 'npv': [], 'auc': []}
 
 # create empty lists to store each run's ROC curve points (for the plots)
 fpr_list = []
@@ -251,7 +263,7 @@ for i in range(n_runs):
     random.seed(i)
 
     # 1. new train/test split (different each run because the seed changed)
-    training_indices, testing_indices = split(df)
+    training_indices, testing_indices = split(df, random_state = i)
 
     # SANITY CHECK: no patient in both train and test - only printed when mismatch
     train_pids = set(df.loc[training_indices, 'pid'])
@@ -260,11 +272,32 @@ for i in range(n_runs):
         print(f"  WARNING run {i+1}: patient leakage!")
 
     # 2. inner CV + grid search on this run's training set
-    inner_cv = inner_k_fold_cv(df, training_indices)
+    rf = RandomForestClassifier(
+    criterion='gini', class_weight="balanced", random_state=i, n_jobs=-1)
+    inner_cv = inner_k_fold_cv(df, training_indices, random_state = i)
     grid = GridSearchCV(rf, param_grid, cv=inner_cv,
                         scoring="roc_auc", n_jobs=1, refit=True)
     grid.fit(getFeatures(df, training_indices),
              getTarget(df, training_indices))
+
+    # print(grid.cv_results_)
+    
+    # 2.5. Get the training metrics
+    best_rf = grid.best_estimator_
+    predicted = best_rf.predict(getFeatures(df, training_indices))
+    y_test = getTarget(df, training_indices)
+    cm = metrics.confusion_matrix(y_test, predicted, labels=["NC", "C"])
+    tn, fp, fn, tp = cm.ravel()
+    tr_metrics['acc'].append(accuracy_score(y_test, predicted))
+    tr_metrics['sens'].append(tp / (tp + fn))
+    tr_metrics['spec'].append(tn / (tn + fp))
+    tr_metrics['ppv'].append(tp / (tp + fp))
+    tr_metrics['npv'].append(tn / (tn + fn))
+    probs = best_rf.predict_proba(getFeatures(df, training_indices))
+    c_index = list(best_rf.classes_).index("C")
+    preds = probs[:, c_index]
+    fpr, tpr, threshold = metrics.roc_curve(y_test, probs, pos_label="C")
+    tr_metrics['auc'].append(metrics.auc(fpr, tpr))
 
     # 3. predict on this run's test set
     best_rf = grid.best_estimator_
@@ -315,17 +348,26 @@ print(f"AUC:         {np.mean(auc_list):.3f}")
 print()
 print("="*30)
 
+te_metrics = {'acc': acc_list, 'sens': sens_list, 'spec': spec_list, 'ppv': ppv_list, 'npv': npv_list, 'auc': auc_list}
+with open('tr_metrics.json', 'w') as f:
+    f.write(json.dumps(tr_metrics))
+with open('te_metrics.json', 'w') as f:
+    f.write(json.dumps(te_metrics))
+
+
 # Plot 1: all 51 ROC curves on one figure
 plt.figure()
 for i in range(n_runs):
     plt.plot(fpr_list[i], tpr_list[i], color='blue', alpha=0.2)
 plt.plot([0, 1], [0, 1], 'r--')
 plt.xlim([0, 1])
+ax = plt.gca()
+ax.set_xlim(ax.get_xlim()[::-1])
 plt.ylim([0, 1])
 plt.xlabel('False Positive Rate')
 plt.ylabel('True Positive Rate')
-plt.title(f'ROC curves - all {n_runs} runs')
-plt.show()
+plt.title(f'All ROC Curves from {n_runs} Itertions of Outer-loop Nested CV')
+plt.savefig(f'All_ROC_Curves_from_{n_runs}_Itertions_of_Outer-loop_Nested_CV.png')
 
 # Plot 2: the average ROC curve
 # Each run's curve has different points, so we can't average them directly.
@@ -344,12 +386,14 @@ mean_tpr[-1] = 1.0                            # force end at (1,1)
 mean_auc = metrics.auc(mean_fpr, mean_tpr)
 
 plt.figure()
-plt.plot(mean_fpr, mean_tpr, 'b', label='Mean AUC = %0.2f' % mean_auc)
+plt.plot(mean_fpr, mean_tpr, 'b', label='Mean AUC = %0.6f' % mean_auc)
 plt.plot([0, 1], [0, 1], 'r--')
 plt.xlim([0, 1])
+ax = plt.gca()
+ax.set_xlim(ax.get_xlim()[::-1])
 plt.ylim([0, 1])
 plt.xlabel('False Positive Rate')
 plt.ylabel('True Positive Rate')
 plt.title(f'Average ROC curve over {n_runs} runs')
 plt.legend(loc='lower right')
-plt.show()
+plt.savefig(f'Average_ROC_curve_over_{n_runs}_runs.png')
