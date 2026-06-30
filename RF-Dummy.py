@@ -135,7 +135,9 @@ def inner_k_fold_cv(df: pd.DataFrame, indices: list, k: int = 5, shuffle: bool =
             if pid in pid_folds[fold]:
                 folds.append(fold)
 
-    print(len(indices), len(folds))
+    # SANITY CHECK: patient's label in the folds - only printed when mismatch
+    if len(indices) != len(folds):
+        print("  WARNING: fold labelling mismatch!")
 
     return PredefinedSplit(folds)
     # 'PredefinedSplit' creates one fold for each distinct value it sees in the list we hand it.
@@ -218,7 +220,7 @@ plt.title('Receiver Operating Characteristic')
 plt.plot(fpr, tpr, 'b', label='AUC = %0.2f' % roc_auc)
 plt.legend(loc='lower right')
 plt.plot([0, 1], [0, 1], 'r--')
-plt.xlim([0, 1])s
+plt.xlim([0, 1])
 plt.ylim([0, 1])
 plt.ylabel('True Positive Rate')
 plt.xlabel('False Positive Rate')
@@ -226,10 +228,11 @@ plt.show()
 print("="*30)
 print()
 
+# ===========================================
 # Outer loop - 51 iterations
 n_runs = 51
 
-# empty lists to collect each run's results
+# create empty lists to collect each run's results
 acc_list = []
 sens_list = []
 spec_list = []
@@ -237,13 +240,11 @@ ppv_list = []
 npv_list = []
 auc_list = []
 
-# to store each run's ROC curve points (for the plots)
+# create empty lists to store each run's ROC curve points (for the plots)
 fpr_list = []
 tpr_list = []
 
-print("\n" + "="*30)
 print(f"Running {n_runs} iterations")
-print("="*30)
 
 for i in range(n_runs):
     # make this block of code run different from the others and reproducible
@@ -251,6 +252,12 @@ for i in range(n_runs):
 
     # 1. new train/test split (different each run because the seed changed)
     training_indices, testing_indices = split(df)
+
+    # SANITY CHECK: no patient in both train and test - only printed when mismatch
+    train_pids = set(df.loc[training_indices, 'pid'])
+    test_pids  = set(df.loc[testing_indices, 'pid'])
+    if len(train_pids & test_pids) > 0:
+        print(f"  WARNING run {i+1}: patient leakage!")
 
     # 2. inner CV + grid search on this run's training set
     inner_cv = inner_k_fold_cv(df, training_indices)
@@ -268,7 +275,7 @@ for i in range(n_runs):
     cm = metrics.confusion_matrix(y_test, predicted, labels=["NC", "C"])
     tn, fp, fn, tp = cm.ravel()
 
-    # 5. the metrics
+    # 5. the performance metrics
     accuracy = accuracy_score(y_test, predicted)
     sensitivity = tp / (tp + fn)
     specificity = tn / (tn + fp)
@@ -323,13 +330,13 @@ plt.show()
 # Plot 2: the average ROC curve
 # Each run's curve has different points, so we can't average them directly.
 # We re-measure every curve on the same x-axis grid, then average the heights.
-mean_fpr = np.linspace(0, 1, 100)   # 100 shared x-axis points from 0 to 1
+mean_fpr = np.linspace(0, 1, 100) # 100 shared x-axis points from 0 to 1
 tpr_interp_list = []
 
 for i in range(n_runs):
     # re-measure on the grid
     interp_tpr = np.interp(mean_fpr, fpr_list[i], tpr_list[i])
-    interp_tpr[0] = 0.0             # force start at (0,0)
+    interp_tpr[0] = 0.0 # force start at (0,0)
     tpr_interp_list.append(interp_tpr)
 
 mean_tpr = np.mean(tpr_interp_list, axis=0)  # average height at each x point
