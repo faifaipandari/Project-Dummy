@@ -20,6 +20,8 @@ import json
 # ===========================================
 
 # "Give me the inputs for these rows"
+
+
 def getFeatures(data: pd.DataFrame, indices: list, features=[]):
     if features == []:  # Features = x_col, we upgrade this to make sure that we can select the features we want out of the real spectrum
         # The column name of the features we choose for this dummy dataset
@@ -221,13 +223,12 @@ fpr, tpr, threshold = metrics.roc_curve(
 roc_auc = metrics.auc(fpr, tpr)  # calculate AUC value
 
 # plot ROC curve
+specificity = 1 - fpr  # convert FPR -> Specificity
 plt.title('Receiver Operating Characteristic of the Inner-loop Nested CV')
-plt.plot(fpr, tpr, 'b', label='AUC = %0.6f' % roc_auc)
+plt.plot(1-fpr, tpr, 'b', label='AUC = %0.6f' % roc_auc)
 plt.legend(loc='lower right')
-plt.plot([0, 1], [0, 1], 'r--')
-plt.xlim([0, 1])
-ax = plt.gca()
-ax.set_xlim(ax.get_xlim()[::-1])
+plt.plot([1, 0], [0, 1], 'r--')  # diagonal, now in spec space
+plt.xlim([1, 0])  # 1.0 on left, 0.0 on right
 plt.ylim([0, 1])
 plt.ylabel('True Positive Rate')
 plt.xlabel('False Positive Rate')
@@ -249,8 +250,14 @@ spec_list = []
 ppv_list = []
 npv_list = []
 auc_list = []
+te_cm_list = []
 
-tr_metrics = {'acc': [], 'sens': [], 'spec': [], 'ppv': [], 'npv': [], 'auc': []}
+# create empty lists for per-fold validation
+per_fold_cm_list = []
+per_fold_auc_list = []
+
+tr_metrics = {'acc': [], 'sens': [],
+              'spec': [], 'ppv': [], 'npv': [], 'auc': [], 'cm': []}
 
 # create empty lists to store each run's ROC curve points (for the plots)
 fpr_list = []
@@ -263,30 +270,74 @@ for i in range(n_runs):
     random.seed(i)
 
     # 1. new train/test split (different each run because the seed changed)
-    training_indices, testing_indices = split(df, random_state = i)
+    training_indices, testing_indices = split(df, random_state=i)
 
     # SANITY CHECK: no patient in both train and test - only printed when mismatch
     train_pids = set(df.loc[training_indices, 'pid'])
-    test_pids  = set(df.loc[testing_indices, 'pid'])
+    test_pids = set(df.loc[testing_indices, 'pid'])
     if len(train_pids & test_pids) > 0:
         print(f"  WARNING run {i+1}: patient leakage!")
 
     # 2. inner CV + grid search on this run's training set
     rf = RandomForestClassifier(
-    criterion='gini', class_weight="balanced", random_state=i, n_jobs=-1)
-    inner_cv = inner_k_fold_cv(df, training_indices, random_state = i)
+        criterion='gini', class_weight="balanced", random_state=i, n_jobs=-1)
+    inner_cv = inner_k_fold_cv(df, training_indices, random_state=i)
     grid = GridSearchCV(rf, param_grid, cv=inner_cv,
                         scoring="roc_auc", n_jobs=1, refit=True)
     grid.fit(getFeatures(df, training_indices),
              getTarget(df, training_indices))
 
-    # print(grid.cv_results_)
-    
-    # 2.5. Get the training metrics
+    # 2.1. Get the per-fold confusion metric and AUC
+    # rebuild this per-fold training data run
+    X_tr = getFeatures(df, training_indices)
+    Y_tr = getTarget(df, training_indices)
+
+    per_fold_cm = []
+    per_fold_auc = []
+
+    # create per-fold data
+    # handing 1 out of 5 fold at a time
+    for fold, (train_index, test_index) in enumerate(inner_cv.split(X_tr, Y_tr)):
+        # this fold's data
+        X_train_fold, X_test_fold = X_tr.iloc[train_index], X_tr.iloc[test_index]
+        y_train_fold, y_test_fold = Y_tr.iloc[train_index], Y_tr.iloc[test_index]
+
+        # RF model for each fold
+        model = RandomForestClassifier(
+            criterion='gini', class_weight='balanced', random_state=i, n_jobs=-1,
+            n_estimators=grid.best_params_['n_estimators'],
+            max_depth=grid.best_params_['max_depth'],
+            min_samples_leaf=grid.best_params_['min_samples_leaf'],
+            max_features=grid.best_params_['max_features'])
+        model.fit(X_train_fold, y_train_fold)
+
+        # implement the confusion matrix from the predictions
+        y_pred = model.predict(X_test_fold)
+        cm = metrics.confusion_matrix(y_test_fold, y_pred, labels=["NC", "C"])
+        per_fold_cm.append(cm)
+
+        # implement the AUC value per fold
+        probs = model.predict_proba(X_test_fold)
+        c_index = list(model.classes_).index("C")
+        preds = probs[:, c_index]
+        fpr, tpr, threshold = metrics.roc_curve(
+            y_test_fold, preds, pos_label="C")
+        fold_auc = metrics.auc(fpr, tpr)
+        per_fold_auc.append(fold_auc)
+
+        # print result from k=0 (1)
+        print(f"Run {i+1:2d} fold {fold}: AUC {fold_auc:.3f}")
+        print(cm)
+
+    per_fold_cm_list.append(per_fold_cm)
+    per_fold_auc_list.append(per_fold_auc)
+
+    # 2.2. Get the training metrics
     best_rf = grid.best_estimator_
     predicted = best_rf.predict(getFeatures(df, training_indices))
     y_test = getTarget(df, training_indices)
     cm = metrics.confusion_matrix(y_test, predicted, labels=["NC", "C"])
+    tr_metrics['cm'].append(cm.tolist())
     tn, fp, fn, tp = cm.ravel()
     tr_metrics['acc'].append(accuracy_score(y_test, predicted))
     tr_metrics['sens'].append(tp / (tp + fn))
@@ -296,7 +347,7 @@ for i in range(n_runs):
     probs = best_rf.predict_proba(getFeatures(df, training_indices))
     c_index = list(best_rf.classes_).index("C")
     preds = probs[:, c_index]
-    fpr, tpr, threshold = metrics.roc_curve(y_test, probs, pos_label="C")
+    fpr, tpr, threshold = metrics.roc_curve(y_test, preds, pos_label="C")
     tr_metrics['auc'].append(metrics.auc(fpr, tpr))
 
     # 3. predict on this run's test set
@@ -307,6 +358,7 @@ for i in range(n_runs):
     # 4. confusion matrix -> TN, FP, FN, TP
     cm = metrics.confusion_matrix(y_test, predicted, labels=["NC", "C"])
     tn, fp, fn, tp = cm.ravel()
+    te_cm_list.append(cm.tolist())
 
     # 5. the performance metrics
     accuracy = accuracy_score(y_test, predicted)
@@ -348,37 +400,61 @@ print(f"AUC:         {np.mean(auc_list):.3f}")
 print()
 print("="*30)
 
-te_metrics = {'acc': acc_list, 'sens': sens_list, 'spec': spec_list, 'ppv': ppv_list, 'npv': npv_list, 'auc': auc_list}
+te_metrics = {'acc': acc_list, 'sens': sens_list, 'spec': spec_list,
+              'ppv': ppv_list, 'npv': npv_list, 'auc': auc_list, 'cm': te_cm_list}
+
+# making separate .json files for training and testing
+# training file: original line + averages line
 with open('tr_metrics.json', 'w') as f:
     f.write(json.dumps(tr_metrics))
+    f.write('\n')
+    f.write(json.dumps({'average': {
+        'acc':  np.mean(tr_metrics['acc']),
+        'sens': np.mean(tr_metrics['sens']),
+        'spec': np.mean(tr_metrics['spec']),
+        'ppv':  np.mean(tr_metrics['ppv']),
+        'npv':  np.mean(tr_metrics['npv']),
+        'auc':  np.mean(tr_metrics['auc']),
+        'cm':   np.mean(tr_metrics['cm'], axis=0).tolist()}}))
+
+# test file: original line + averages line
 with open('te_metrics.json', 'w') as f:
     f.write(json.dumps(te_metrics))
+    f.write('\n')
+    f.write(json.dumps({'average': {
+        'acc':  np.mean(acc_list),
+        'sens': np.mean(sens_list),
+        'spec': np.mean(spec_list),
+        'ppv':  np.mean(ppv_list),
+        'npv':  np.mean(npv_list),
+        'auc':  np.mean(auc_list),
+        'cm':   np.mean(te_cm_list, axis=0).tolist()}}))
 
 
 # Plot 1: all 51 ROC curves on one figure
 plt.figure()
+specificity = 1 - fpr
 for i in range(n_runs):
-    plt.plot(fpr_list[i], tpr_list[i], color='blue', alpha=0.2)
-plt.plot([0, 1], [0, 1], 'r--')
-plt.xlim([0, 1])
-ax = plt.gca()
-ax.set_xlim(ax.get_xlim()[::-1])
+    plt.plot(1-fpr_list[i], tpr_list[i], color='blue', alpha=0.2)
+plt.plot([1, 0], [0, 1], 'r--')
+plt.xlim([1, 0])
 plt.ylim([0, 1])
 plt.xlabel('False Positive Rate')
 plt.ylabel('True Positive Rate')
 plt.title(f'All ROC Curves from {n_runs} Itertions of Outer-loop Nested CV')
-plt.savefig(f'All_ROC_Curves_from_{n_runs}_Itertions_of_Outer-loop_Nested_CV.png')
+plt.savefig(
+    f'All_ROC_Curves_from_{n_runs}_Itertions_of_Outer-loop_Nested_CV.png')
 
 # Plot 2: the average ROC curve
 # Each run's curve has different points, so we can't average them directly.
 # We re-measure every curve on the same x-axis grid, then average the heights.
-mean_fpr = np.linspace(0, 1, 100) # 100 shared x-axis points from 0 to 1
+mean_fpr = np.linspace(0, 1, 100)  # 100 shared x-axis points from 0 to 1
 tpr_interp_list = []
 
 for i in range(n_runs):
     # re-measure on the grid
     interp_tpr = np.interp(mean_fpr, fpr_list[i], tpr_list[i])
-    interp_tpr[0] = 0.0 # force start at (0,0)
+    interp_tpr[0] = 0.0  # force start at (0,0)
     tpr_interp_list.append(interp_tpr)
 
 mean_tpr = np.mean(tpr_interp_list, axis=0)  # average height at each x point
@@ -386,11 +462,10 @@ mean_tpr[-1] = 1.0                            # force end at (1,1)
 mean_auc = metrics.auc(mean_fpr, mean_tpr)
 
 plt.figure()
-plt.plot(mean_fpr, mean_tpr, 'b', label='Mean AUC = %0.6f' % mean_auc)
-plt.plot([0, 1], [0, 1], 'r--')
-plt.xlim([0, 1])
-ax = plt.gca()
-ax.set_xlim(ax.get_xlim()[::-1])
+specificity = 1 - fpr
+plt.plot(1-mean_fpr, mean_tpr, 'b', label='Mean AUC = %0.6f' % mean_auc)
+plt.plot([1, 0], [0, 1], 'r--')
+plt.xlim([1, 0])
 plt.ylim([0, 1])
 plt.xlabel('False Positive Rate')
 plt.ylabel('True Positive Rate')
