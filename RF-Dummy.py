@@ -1,17 +1,17 @@
 # Random Forest: cancer (C) vs non-cancer (NC) from X_1–X_9
 # 70:30 train/test split + 5-fold NESTED cross-validation
 
-import sklearn.metrics as metrics
 import pandas as pd
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
-from sklearn import metrics
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, roc_auc_score, roc_curve, confusion_matrix, auc
 from sklearn.model_selection import (
     train_test_split, GridSearchCV, StratifiedKFold, PredefinedSplit)
 from sklearn.ensemble import RandomForestClassifier
 import random
+
+from copy import deepcopy
 
 import json
 
@@ -150,11 +150,62 @@ def inner_k_fold_cv(df: pd.DataFrame, indices: list, k: int = 5, shuffle: bool =
     # 'PredefinedSplit' creates one fold for each distinct value it sees in the list we hand it.
     # So the number of folds is decided entirely by how many unique numbers end up in folds.
 
+def calculateMetrics(cm: confusion_matrix):
+    metrics = {}
+    tn, fp, fn, tp = cm.ravel().tolist()
+    metrics['acc'] = ((tp + tn) / (tp + fp + tn + fn))
+    metrics['sens'] = (tp / (tp + fn))
+    metrics['spec'] = (tn / (tn + fp))
+    metrics['ppv'] = (tp / (tp + fp))
+    metrics['npv'] = (tn / (tn + fn))
+    return metrics
+
+
+CV_METRICS_FILE = 'cv_metrics.json'
+with open(CV_METRICS_FILE, 'w') as f:
+    pass
+
+cv_metrics = []
+
+# creating our own function for the per-fold CV performance (2.1 in the outer-loop CV)
+def aucScoring(model, features, targets):
+    preds = model.predict(features)
+    cm = confusion_matrix(targets, preds, labels=["NC", "C"])
+    metrics = calculateMetrics(cm)
+    probs = model.predict_proba(features)
+    c_index = list(model.classes_).index("C") # .class = pick the column that we want to use: "C"/nc column
+    preds = probs[:, c_index]  # keep only 'C' as prob of c+nc = 1
+    targets = [1 if target == 'C' else 0 for target in targets]
+    roc_auc = roc_auc_score(targets, preds)
+    metrics['roc_auc'] = roc_auc
+    cv_metrics.append(metrics)
+    
+    print(len(cv_metrics))
+
+    if (len(cv_metrics) % 27) == 0:
+        best_permutation = {'roc_auc': -1}
+        print(f'Hello!! : {len(cv_metrics[-27:])}')
+        for cv_metric in cv_metrics[-27:]:
+            if cv_metric['roc_auc'] > best_permutation['roc_auc']:
+                best_permutation = deepcopy(cv_metric)
+        with open(CV_METRICS_FILE, 'a') as f:
+            f.write(json.dumps(best_permutation) + '\n')
+    return roc_auc
+    
+    # 6. ROC curve + AUC
+    probs = best_rf.predict_proba(getFeatures(df, testing_indices))
+    c_index = list(best_rf.classes_).index("C")
+    preds = probs[:, c_index]
+    fpr, tpr, threshold = roc_curve(y_test, preds, pos_label="C")
+    roc_auc = roc_auc_score(y_test, preds)
+
+
+
 
 # searching the best method
 inner_cv = inner_k_fold_cv(df, training_indices)
 grid = GridSearchCV(rf, param_grid, cv=inner_cv,
-                    scoring="roc_auc", n_jobs=1, refit=True)
+                    scoring=aucScoring, n_jobs=1, refit=True)
 # rf = the estimator, param_grid = the hyperparameters to search, cv = the cross-validation strategy used to score each candidate,
 # scoring="roc_auc" to decide which hyperparameter combination is the best, n_jobs=1 do one job at a time,
 # refit=True to refit the best model on the whole training set after grid search.
@@ -180,7 +231,7 @@ print(importance_table.round(3))
 print()
 
 # 8. Confusion matrix on the test set
-cm = metrics.confusion_matrix(
+cm = confusion_matrix(
     getTarget(df, testing_indices), predicted, labels=["NC", "C"])
 cm_df = pd.DataFrame(cm,
                      index=["True NC", "True C"],
@@ -218,9 +269,9 @@ probs = best_rf.predict_proba(X_test)
 # .class = pick the column that we want to use: "C"/nc column
 c_index = list(best_rf.classes_).index("C")
 preds = probs[:, c_index]  # keep only 'C' as prob of c+nc = 1
-fpr, tpr, threshold = metrics.roc_curve(
+fpr, tpr, threshold = roc_curve(
     y_test, preds, pos_label="C")  # build the ROC curve
-roc_auc = metrics.auc(fpr, tpr)  # calculate AUC value
+roc_auc = roc_auc_score(y_test, preds)  # calculate AUC value
 
 # plot ROC curve
 specificity = 1 - fpr  # convert FPR -> Specificity
@@ -241,7 +292,7 @@ print()
 # ===========================================
 
 # Set n = 51 for iterations
-n_runs = 3
+n_runs = 5
 
 # create empty lists to collect each run's results
 acc_list = []
@@ -287,56 +338,11 @@ for i in range(n_runs):
     grid.fit(getFeatures(df, training_indices),
              getTarget(df, training_indices))
 
-    # 2.1. Get the per-fold confusion metric and AUC
-    # rebuild this per-fold training data run
-    X_tr = getFeatures(df, training_indices)
-    Y_tr = getTarget(df, training_indices)
-
-    per_fold_cm = []
-    per_fold_auc = []
-
-    # create per-fold data
-    # handing 1 out of 5 fold at a time
-    for fold, (train_index, test_index) in enumerate(inner_cv.split(X_tr, Y_tr)):
-        # this fold's data
-        X_train_fold, X_test_fold = X_tr.iloc[train_index], X_tr.iloc[test_index]
-        y_train_fold, y_test_fold = Y_tr.iloc[train_index], Y_tr.iloc[test_index]
-
-        # RF model for each fold
-        model = RandomForestClassifier(
-            criterion='gini', class_weight='balanced', random_state=i, n_jobs=-1,
-            n_estimators=grid.best_params_['n_estimators'],
-            max_depth=grid.best_params_['max_depth'],
-            min_samples_leaf=grid.best_params_['min_samples_leaf'],
-            max_features=grid.best_params_['max_features'])
-        model.fit(X_train_fold, y_train_fold)
-
-        # implement the confusion matrix from the predictions
-        y_pred = model.predict(X_test_fold)
-        cm = metrics.confusion_matrix(y_test_fold, y_pred, labels=["NC", "C"])
-        per_fold_cm.append(cm)
-
-        # implement the AUC value per fold
-        probs = model.predict_proba(X_test_fold)
-        c_index = list(model.classes_).index("C")
-        preds = probs[:, c_index]
-        fpr, tpr, threshold = metrics.roc_curve(
-            y_test_fold, preds, pos_label="C")
-        fold_auc = metrics.auc(fpr, tpr)
-        per_fold_auc.append(fold_auc)
-
-        # print result from k=0 (1)
-        print(f"Run {i+1:2d} fold {fold}: AUC {fold_auc:.3f}")
-        print(cm)
-
-    per_fold_cm_list.append(per_fold_cm)
-    per_fold_auc_list.append(per_fold_auc)
-
     # 2.2. Get the training metrics
     best_rf = grid.best_estimator_
     predicted = best_rf.predict(getFeatures(df, training_indices))
     y_test = getTarget(df, training_indices)
-    cm = metrics.confusion_matrix(y_test, predicted, labels=["NC", "C"])
+    cm = confusion_matrix(y_test, predicted, labels=["NC", "C"])
     tr_metrics['cm'].append(cm.tolist())
     tn, fp, fn, tp = cm.ravel()
     tr_metrics['acc'].append(accuracy_score(y_test, predicted))
@@ -347,8 +353,8 @@ for i in range(n_runs):
     probs = best_rf.predict_proba(getFeatures(df, training_indices))
     c_index = list(best_rf.classes_).index("C")
     preds = probs[:, c_index]
-    fpr, tpr, threshold = metrics.roc_curve(y_test, preds, pos_label="C")
-    tr_metrics['auc'].append(metrics.auc(fpr, tpr))
+    fpr, tpr, threshold = roc_curve(y_test, preds, pos_label="C")
+    tr_metrics['auc'].append(roc_auc_score(y_test, preds))
 
     # 3. predict on this run's test set
     best_rf = grid.best_estimator_
@@ -356,7 +362,7 @@ for i in range(n_runs):
     y_test = getTarget(df, testing_indices)
 
     # 4. confusion matrix -> TN, FP, FN, TP
-    cm = metrics.confusion_matrix(y_test, predicted, labels=["NC", "C"])
+    cm = confusion_matrix(y_test, predicted, labels=["NC", "C"])
     tn, fp, fn, tp = cm.ravel()
     te_cm_list.append(cm.tolist())
 
@@ -371,8 +377,8 @@ for i in range(n_runs):
     probs = best_rf.predict_proba(getFeatures(df, testing_indices))
     c_index = list(best_rf.classes_).index("C")
     preds = probs[:, c_index]
-    fpr, tpr, threshold = metrics.roc_curve(y_test, preds, pos_label="C")
-    roc_auc = metrics.auc(fpr, tpr)
+    fpr, tpr, threshold = roc_curve(y_test, preds, pos_label="C")
+    roc_auc = roc_auc_score(y_test, preds)
 
     # 7. save everything from this run
     acc_list.append(accuracy)
@@ -459,7 +465,7 @@ for i in range(n_runs):
 
 mean_tpr = np.mean(tpr_interp_list, axis=0)  # average height at each x point
 mean_tpr[-1] = 1.0                            # force end at (1,1)
-mean_auc = metrics.auc(mean_fpr, mean_tpr)
+mean_auc = auc(mean_fpr, mean_tpr)
 
 plt.figure()
 specificity = 1 - fpr
