@@ -10,9 +10,7 @@ from sklearn.model_selection import (
     train_test_split, GridSearchCV, StratifiedKFold, PredefinedSplit)
 from sklearn.ensemble import RandomForestClassifier
 import random
-
 from copy import deepcopy
-
 import json
 
 # ===========================================
@@ -60,6 +58,7 @@ def split(data: pd.DataFrame, training_size: float = 0.7, shuffle: bool = True, 
     # Splitting the patients
     if shuffle:
         # If shuffling is turned on (it is, by default), randomly reorders the list of patients
+        random.seed(random_state)
         random.shuffle(patients)
     training_patients = patients[:training_num]
     testing_patients = patients[training_num:]
@@ -150,6 +149,7 @@ def inner_k_fold_cv(df: pd.DataFrame, indices: list, k: int = 5, shuffle: bool =
     # 'PredefinedSplit' creates one fold for each distinct value it sees in the list we hand it.
     # So the number of folds is decided entirely by how many unique numbers end up in folds.
 
+
 def calculateMetrics(cm: confusion_matrix):
     metrics = {}
     tn, fp, fn, tp = cm.ravel().tolist()
@@ -168,38 +168,36 @@ with open(CV_METRICS_FILE, 'w') as f:
 cv_metrics = []
 
 # creating our own function for the per-fold CV performance (2.1 in the outer-loop CV)
+
+
 def aucScoring(model, features, targets):
     preds = model.predict(features)
     cm = confusion_matrix(targets, preds, labels=["NC", "C"])
     metrics = calculateMetrics(cm)
     probs = model.predict_proba(features)
-    c_index = list(model.classes_).index("C") # .class = pick the column that we want to use: "C"/nc column
+    # .class = pick the column that we want to use: "C"/nc column
+    c_index = list(model.classes_).index("C")
     preds = probs[:, c_index]  # keep only 'C' as prob of c+nc = 1
     targets = [1 if target == 'C' else 0 for target in targets]
     roc_auc = roc_auc_score(targets, preds)
     metrics['roc_auc'] = roc_auc
     cv_metrics.append(metrics)
-    
-    print(len(cv_metrics))
 
+    # making sure that the best performance only print ONCE within the 27 permutation of the RF features
     if (len(cv_metrics) % 27) == 0:
         best_permutation = {'roc_auc': -1}
-        print(f'Hello!! : {len(cv_metrics[-27:])}')
+
+        # SANITY CHECK: only prints if a batch isn't the expected 27
+        if len(cv_metrics[-27:]) != 27:
+            print(
+                f"  WARNING: expected 27 permutations, got {len(cv_metrics[-27:])}")
+
         for cv_metric in cv_metrics[-27:]:
             if cv_metric['roc_auc'] > best_permutation['roc_auc']:
                 best_permutation = deepcopy(cv_metric)
         with open(CV_METRICS_FILE, 'a') as f:
             f.write(json.dumps(best_permutation) + '\n')
     return roc_auc
-    
-    # 6. ROC curve + AUC
-    probs = best_rf.predict_proba(getFeatures(df, testing_indices))
-    c_index = list(best_rf.classes_).index("C")
-    preds = probs[:, c_index]
-    fpr, tpr, threshold = roc_curve(y_test, preds, pos_label="C")
-    roc_auc = roc_auc_score(y_test, preds)
-
-
 
 
 # searching the best method
@@ -213,6 +211,17 @@ grid = GridSearchCV(rf, param_grid, cv=inner_cv,
 # 6. Tune on the full training set, then test on the 30% testing set
 # inner CV picks the best params (from training set)
 grid.fit(getFeatures(df, training_indices), getTarget(df, training_indices))
+
+# spread of the inner CV scores (across all fold evaluations)
+print("="*30)
+print()
+print("Inner CV scores (mean ± std over", len(cv_metrics), "evaluations):")
+for key in ['acc', 'sens', 'spec', 'ppv', 'npv', 'roc_auc']:
+    # pull this metric out of every dict
+    values = [m[key] for m in cv_metrics]
+    print(f"  {key:8s} {np.mean(values):.3f} ± {np.std(values):.3f}")
+
+print()
 print("="*30)
 print()
 print("Best hyperparameters:", grid.best_params_)
@@ -271,7 +280,8 @@ c_index = list(best_rf.classes_).index("C")
 preds = probs[:, c_index]  # keep only 'C' as prob of c+nc = 1
 fpr, tpr, threshold = roc_curve(
     y_test, preds, pos_label="C")  # build the ROC curve
-roc_auc = roc_auc_score(y_test, preds)  # calculate AUC value
+y_bin = [1 if y == "C" else 0 for y in y_test]   # C -> 1, NC -> 0
+roc_auc = roc_auc_score(y_bin, preds)  # calculate AUC value
 
 # plot ROC curve
 specificity = 1 - fpr  # convert FPR -> Specificity
@@ -292,7 +302,7 @@ print()
 # ===========================================
 
 # Set n = 51 for iterations
-n_runs = 5
+n_runs = 51
 
 # create empty lists to collect each run's results
 acc_list = []
@@ -343,8 +353,9 @@ for i in range(n_runs):
     predicted = best_rf.predict(getFeatures(df, training_indices))
     y_test = getTarget(df, training_indices)
     cm = confusion_matrix(y_test, predicted, labels=["NC", "C"])
-    tr_metrics['cm'].append(cm.tolist())
     tn, fp, fn, tp = cm.ravel()
+    tr_metrics['cm'].append(
+        {"TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn)})
     tr_metrics['acc'].append(accuracy_score(y_test, predicted))
     tr_metrics['sens'].append(tp / (tp + fn))
     tr_metrics['spec'].append(tn / (tn + fp))
@@ -354,7 +365,8 @@ for i in range(n_runs):
     c_index = list(best_rf.classes_).index("C")
     preds = probs[:, c_index]
     fpr, tpr, threshold = roc_curve(y_test, preds, pos_label="C")
-    tr_metrics['auc'].append(roc_auc_score(y_test, preds))
+    y_bin = [1 if y == "C" else 0 for y in y_test]
+    tr_metrics['auc'].append(roc_auc_score(y_bin, preds))
 
     # 3. predict on this run's test set
     best_rf = grid.best_estimator_
@@ -364,7 +376,8 @@ for i in range(n_runs):
     # 4. confusion matrix -> TN, FP, FN, TP
     cm = confusion_matrix(y_test, predicted, labels=["NC", "C"])
     tn, fp, fn, tp = cm.ravel()
-    te_cm_list.append(cm.tolist())
+    te_cm_list.append(
+        {"TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn)})
 
     # 5. the performance metrics
     accuracy = accuracy_score(y_test, predicted)
@@ -378,7 +391,8 @@ for i in range(n_runs):
     c_index = list(best_rf.classes_).index("C")
     preds = probs[:, c_index]
     fpr, tpr, threshold = roc_curve(y_test, preds, pos_label="C")
-    roc_auc = roc_auc_score(y_test, preds)
+    y_bin = [1 if y == "C" else 0 for y in y_test]
+    roc_auc = roc_auc_score(y_bin, preds)
 
     # 7. save everything from this run
     acc_list.append(accuracy)
@@ -396,13 +410,13 @@ for i in range(n_runs):
 
 # Averages over all runs
 print()
-print(f"Averages over {n_runs} runs:")
-print(f"Accuracy:    {np.mean(acc_list):.3f}")
-print(f"Sensitivity: {np.mean(sens_list):.3f}")
-print(f"Specificity: {np.mean(spec_list):.3f}")
-print(f"PPV:         {np.mean(ppv_list):.3f}")
-print(f"NPV:         {np.mean(npv_list):.3f}")
-print(f"AUC:         {np.mean(auc_list):.3f}")
+print(f"Averages over {n_runs} runs (mean ± std):")
+print(f"Accuracy:    {np.mean(acc_list):.3f} ± {np.std(acc_list):.3f}")
+print(f"Sensitivity: {np.mean(sens_list):.3f} ± {np.std(sens_list):.3f}")
+print(f"Specificity: {np.mean(spec_list):.3f} ± {np.std(spec_list):.3f}")
+print(f"PPV:         {np.mean(ppv_list):.3f} ± {np.std(ppv_list):.3f}")
+print(f"NPV:         {np.mean(npv_list):.3f} ± {np.std(npv_list):.3f}")
+print(f"AUC:         {np.mean(auc_list):.3f} ± {np.std(auc_list):.3f}")
 print()
 print("="*30)
 
@@ -411,22 +425,10 @@ te_metrics = {'acc': acc_list, 'sens': sens_list, 'spec': spec_list,
 
 # making separate .json files for training and testing
 # training file: original line + averages line
-with open('tr_metrics.json', 'w') as f:
-    f.write(json.dumps(tr_metrics))
-    f.write('\n')
-    f.write(json.dumps({'average': {
-        'acc':  np.mean(tr_metrics['acc']),
-        'sens': np.mean(tr_metrics['sens']),
-        'spec': np.mean(tr_metrics['spec']),
-        'ppv':  np.mean(tr_metrics['ppv']),
-        'npv':  np.mean(tr_metrics['npv']),
-        'auc':  np.mean(tr_metrics['auc']),
-        'cm':   np.mean(tr_metrics['cm'], axis=0).tolist()}}))
-
-# test file: original line + averages line
 with open('te_metrics.json', 'w') as f:
     f.write(json.dumps(te_metrics))
     f.write('\n')
+    # line 2: the averages (mean of each metric)
     f.write(json.dumps({'average': {
         'acc':  np.mean(acc_list),
         'sens': np.mean(sens_list),
@@ -434,7 +436,53 @@ with open('te_metrics.json', 'w') as f:
         'ppv':  np.mean(ppv_list),
         'npv':  np.mean(npv_list),
         'auc':  np.mean(auc_list),
-        'cm':   np.mean(te_cm_list, axis=0).tolist()}}))
+        'cm':   {"TP": np.mean([c["TP"] for c in tr_metrics['cm']]),
+                 "TN": np.mean([c["TN"] for c in tr_metrics['cm']]),
+                 "FP": np.mean([c["FP"] for c in tr_metrics['cm']]),
+                 "FN": np.mean([c["FN"] for c in tr_metrics['cm']])}}}))
+    f.write('\n')
+    # line 3: the standard deviations
+    f.write(json.dumps({'std': {
+        'acc':  np.std(acc_list),
+        'sens': np.std(sens_list),
+        'spec': np.std(spec_list),
+        'ppv':  np.std(ppv_list),
+        'npv':  np.std(npv_list),
+        'auc':  np.std(auc_list),
+        'cm':   {"TP": np.std([c["TP"] for c in tr_metrics['cm']]),
+                 "TN": np.std([c["TN"] for c in tr_metrics['cm']]),
+                 "FP": np.std([c["FP"] for c in tr_metrics['cm']]),
+                 "FN": np.std([c["FN"] for c in tr_metrics['cm']])}}}))
+
+# test file: original line + averages line
+with open('te_metrics.json', 'w') as f:
+    f.write(json.dumps(te_metrics))
+    f.write('\n')
+    # line 2: the averages (mean of each metric)
+    f.write(json.dumps({'average': {
+        'acc':  np.mean(acc_list),
+        'sens': np.mean(sens_list),
+        'spec': np.mean(spec_list),
+        'ppv':  np.mean(ppv_list),
+        'npv':  np.mean(npv_list),
+        'auc':  np.mean(auc_list),
+        'cm':   {"TP": np.mean([c["TP"] for c in te_metrics['cm']]),
+                 "TN": np.mean([c["TN"] for c in te_metrics['cm']]),
+                 "FP": np.mean([c["FP"] for c in te_metrics['cm']]),
+                 "FN": np.mean([c["FN"] for c in te_metrics['cm']])}}}))
+    f.write('\n')
+    # line 3: the standard deviations
+    f.write(json.dumps({'std': {
+        'acc':  np.std(acc_list),
+        'sens': np.std(sens_list),
+        'spec': np.std(spec_list),
+        'ppv':  np.std(ppv_list),
+        'npv':  np.std(npv_list),
+        'auc':  np.std(auc_list),
+        'cm':   {"TP": np.std([c["TP"] for c in te_metrics['cm']]),
+                 "TN": np.std([c["TN"] for c in te_metrics['cm']]),
+                 "FP": np.std([c["FP"] for c in te_metrics['cm']]),
+                 "FN": np.std([c["FN"] for c in te_metrics['cm']])}}}))
 
 
 # Plot 1: all 51 ROC curves on one figure
