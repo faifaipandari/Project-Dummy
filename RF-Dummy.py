@@ -5,7 +5,7 @@ import pandas as pd
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
-from sklearn.metrics import accuracy_score, roc_auc_score, roc_curve, confusion_matrix, auc
+from sklearn.metrics import accuracy_score, roc_auc_score, roc_curve, confusion_matrix, auc, make_scorer
 from sklearn.model_selection import (
     train_test_split, GridSearchCV, StratifiedKFold, PredefinedSplit)
 from sklearn.ensemble import RandomForestClassifier
@@ -149,10 +149,12 @@ def inner_k_fold_cv(df: pd.DataFrame, indices: list, k: int = 5, shuffle: bool =
     # 'PredefinedSplit' creates one fold for each distinct value it sees in the list we hand it.
     # So the number of folds is decided entirely by how many unique numbers end up in folds.
 
-
-def calculateMetrics(cm: confusion_matrix):
+def calculateMetrics(cm):
     metrics = {}
-    tn, fp, fn, tp = cm.ravel().tolist()
+    if isinstance(cm, np.ndarray):
+        tn, fp, fn, tp = cm.ravel().tolist()
+    else:
+        tn, fp, fn, tp = cm['tn'], cm['fp'], cm['fn'], cm['tp']
     metrics['acc'] = ((tp + tn) / (tp + fp + tn + fn))
     metrics['sens'] = (tp / (tp + fn))
     metrics['spec'] = (tn / (tn + fp))
@@ -161,50 +163,28 @@ def calculateMetrics(cm: confusion_matrix):
     return metrics
 
 
-CV_METRICS_FILE = 'cv_metrics.json'
-with open(CV_METRICS_FILE, 'w') as f:
-    pass
-
-cv_metrics = []
-
 # creating our own function for the per-fold CV performance (2.1 in the outer-loop CV)
-
 
 def aucScoring(model, features, targets):
 # Gridsearch passes three things: model, features, and target to this function
-    preds = model.predict(features) # getting predictions and the confusion metrix
-    cm = confusion_matrix(targets, preds, labels=["NC", "C"])
-    metrics = calculateMetrics(cm)
     probs = model.predict_proba(features) # getting probability of "C"
     # .class = pick the column that we want to use: "C"/nc column
     c_index = list(model.classes_).index("C")
     preds = probs[:, c_index]  # keep only 'C' as prob of c+nc = 1
     targets = [1 if target == 'C' else 0 for target in targets] # converting labels to 0/1 and computing AUC
-    roc_auc = roc_auc_score(targets, preds)
-    metrics['roc_auc'] = roc_auc # storing te metrix
-    cv_metrics.append(metrics)
-
-    # making sure that the best performance only print ONCE within the 27 permutation of the RF features
-    if (len(cv_metrics) % 27) == 0:
-        best_permutation = {'roc_auc': -1}
-
-        # SANITY CHECK: only prints if a batch isn't the expected 27
-        if len(cv_metrics[-27:]) != 27:
-            print(
-                f"  WARNING: expected 27 permutations, got {len(cv_metrics[-27:])}")
-
-        for cv_metric in cv_metrics[-27:]: # loop through the last 27 results and keep the one with highest AUC
-            if cv_metric['roc_auc'] > best_permutation['roc_auc']:
-                best_permutation = deepcopy(cv_metric)
-        with open(CV_METRICS_FILE, 'a') as f:
-            f.write(json.dumps(best_permutation) + '\n')
-    return roc_auc
+    return roc_auc_score(targets, preds)
 
 
 # searching the best method
+scorer = {'auc': aucScoring,
+          'tn': make_scorer(lambda yt, yp: confusion_matrix(yt, yp, labels=["NC", "C"])[0, 0]),
+          'fp': make_scorer(lambda yt, yp: confusion_matrix(yt, yp, labels=["NC", "C"])[0, 1]),
+          'fn': make_scorer(lambda yt, yp: confusion_matrix(yt, yp, labels=["NC", "C"])[1, 0]),
+          'tp': make_scorer(lambda yt, yp: confusion_matrix(yt, yp, labels=["NC", "C"])[1, 1])}
+
 inner_cv = inner_k_fold_cv(df, training_indices)
 grid = GridSearchCV(rf, param_grid, cv=inner_cv,
-                    scoring=aucScoring, n_jobs=1, refit=True)
+                    scoring=scorer, n_jobs=-1, refit = 'auc')
 # rf = the estimator, param_grid = the hyperparameters to search, cv = the cross-validation strategy used to score each candidate,
 # scoring="roc_auc" to decide which hyperparameter combination is the best, n_jobs=1 do one job at a time,
 # refit=True to refit the best model on the whole training set after grid search.
@@ -212,6 +192,21 @@ grid = GridSearchCV(rf, param_grid, cv=inner_cv,
 # 6. Tune on the full training set, then test on the 30% testing set
 # inner CV picks the best params (from training set)
 grid.fit(getFeatures(df, training_indices), getTarget(df, training_indices))
+
+
+cv_metrics = []
+
+print(grid.best_score_)
+
+cm = {'tn': np.ndarray(np.mean(grid.cv_results_['split0_test_tn']), np.mean(grid.cv_results_['split1_test_tn']), np.mean(grid.cv_results_['split2_test_tn']), np.mean(grid.cv_results_['split3_test_tn']), np.mean(grid.cv_results_['split4_test_tn'])), 
+      'fp': np.ndarray(np.mean(grid.cv_results_['split0_test_fp']), np.mean(grid.cv_results_['split1_test_fp']), np.mean(grid.cv_results_['split2_test_fp']), np.mean(grid.cv_results_['split3_test_fp']), np.mean(grid.cv_results_['split4_test_fp'])), 
+      'fn': np.ndarray(np.mean(grid.cv_results_['split0_test_fn']), np.mean(grid.cv_results_['split1_test_fn']), np.mean(grid.cv_results_['split2_test_fn']), np.mean(grid.cv_results_['split3_test_fn']), np.mean(grid.cv_results_['split4_test_fn'])), 
+      'tp': np.ndarray(np.mean(grid.cv_results_['split0_test_tp']), np.mean(grid.cv_results_['split1_test_tp']), np.mean(grid.cv_results_['split2_test_tp']), np.mean(grid.cv_results_['split3_test_tp']), np.mean(grid.cv_results_['split4_test_tp']))}
+metrics = calculateMetrics(cm)
+for metric in metrics:
+    metrics[metric] = list(metrics[metric])
+metrics['roc_auc'] = list(grid.cv_results_['mean_test_auc'])
+cv_metrics.append(metrics)
 
 # spread of the inner CV scores (across all fold evaluations)
 print("="*30)
@@ -221,6 +216,9 @@ for key in ['acc', 'sens', 'spec', 'ppv', 'npv', 'roc_auc']:
     # pull this metric out of every dict
     values = [m[key] for m in cv_metrics]
     print(f"  {key:8s} {np.mean(values):.3f} ± {np.std(values):.3f}")
+
+with open('cv_metrics.json', 'w') as f:
+    f.write(json.dumps(cv_metrics))
 
 print()
 print("="*30)
@@ -352,7 +350,7 @@ for i in range(n_runs):
         criterion='gini', class_weight="balanced", random_state=i, n_jobs=-1)
     inner_cv = inner_k_fold_cv(df, training_indices, random_state=i)
     grid = GridSearchCV(rf, param_grid, cv=inner_cv,
-                        scoring="roc_auc", n_jobs=1, refit=True)
+                        scoring="roc_auc", n_jobs=-1, refit=True)
     grid.fit(getFeatures(df, training_indices),
              getTarget(df, training_indices))
 
