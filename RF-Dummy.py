@@ -14,7 +14,7 @@ from copy import deepcopy
 import json
 
 # ===========================================
-# Inner Loop
+# Single demonstration run (one split, with 5-fold inner CV inside GridSearchCV)
 # ===========================================
 
 # "Give me the inputs for these rows"
@@ -171,16 +171,17 @@ cv_metrics = []
 
 
 def aucScoring(model, features, targets):
-    preds = model.predict(features)
+# Gridsearch passes three things: model, features, and target to this function
+    preds = model.predict(features) # getting predictions and the confusion metrix
     cm = confusion_matrix(targets, preds, labels=["NC", "C"])
     metrics = calculateMetrics(cm)
-    probs = model.predict_proba(features)
+    probs = model.predict_proba(features) # getting probability of "C"
     # .class = pick the column that we want to use: "C"/nc column
     c_index = list(model.classes_).index("C")
     preds = probs[:, c_index]  # keep only 'C' as prob of c+nc = 1
-    targets = [1 if target == 'C' else 0 for target in targets]
+    targets = [1 if target == 'C' else 0 for target in targets] # converting labels to 0/1 and computing AUC
     roc_auc = roc_auc_score(targets, preds)
-    metrics['roc_auc'] = roc_auc
+    metrics['roc_auc'] = roc_auc # storing te metrix
     cv_metrics.append(metrics)
 
     # making sure that the best performance only print ONCE within the 27 permutation of the RF features
@@ -192,7 +193,7 @@ def aucScoring(model, features, targets):
             print(
                 f"  WARNING: expected 27 permutations, got {len(cv_metrics[-27:])}")
 
-        for cv_metric in cv_metrics[-27:]:
+        for cv_metric in cv_metrics[-27:]: # loop through the last 27 results and keep the one with highest AUC
             if cv_metric['roc_auc'] > best_permutation['roc_auc']:
                 best_permutation = deepcopy(cv_metric)
         with open(CV_METRICS_FILE, 'a') as f:
@@ -258,6 +259,12 @@ print()
 # 9. Dxcover clinical matrics
 # With labels=["NC","C"], the matrix is [[TN, FP], [FN, TP]].
 tn, fp, fn, tp = cm.ravel()
+
+# SANITY CHECK: compare sklearn's accuracy_score with the manual formula
+manual_acc = (tp + tn) / (tp + tn + fp + fn)
+print(f"[check] sklearn acc={score:.6f}  manual acc={manual_acc:.6f}")
+print ()
+
 print("Dxcover clinical matrics:")
 print(f"Sensitivity (recall, C):  {tp/(tp+fn):.3f}")
 print(f"Specificity (recall, NC): {tn/(tn+fp):.3f}")
@@ -298,7 +305,8 @@ print("="*30)
 print()
 
 # ===========================================
-# Outer loop - 51 iterations
+# # Outer loop - repeat the whole experiment n_runs times
+# (the 5-fold inner CV lives inside grid.fit each time)
 # ===========================================
 
 # Set n = 51 for iterations
@@ -424,18 +432,18 @@ te_metrics = {'acc': acc_list, 'sens': sens_list, 'spec': spec_list,
               'ppv': ppv_list, 'npv': npv_list, 'auc': auc_list, 'cm': te_cm_list}
 
 # making separate .json files for training and testing
-# training file: original line + averages line
-with open('te_metrics.json', 'w') as f:
-    f.write(json.dumps(te_metrics))
+# training file: raw per-run data + averages + stds
+with open('tr_metrics.json', 'w') as f:
+    f.write(json.dumps(tr_metrics))
     f.write('\n')
     # line 2: the averages (mean of each metric)
     f.write(json.dumps({'average': {
-        'acc':  np.mean(acc_list),
-        'sens': np.mean(sens_list),
-        'spec': np.mean(spec_list),
-        'ppv':  np.mean(ppv_list),
-        'npv':  np.mean(npv_list),
-        'auc':  np.mean(auc_list),
+        'acc':  np.mean(tr_metrics['acc']),
+        'sens': np.mean(tr_metrics['sens']),
+        'spec': np.mean(tr_metrics['spec']),
+        'ppv':  np.mean(tr_metrics['ppv']),
+        'npv':  np.mean(tr_metrics['npv']),
+        'auc':  np.mean(tr_metrics['auc']),
         'cm':   {"TP": np.mean([c["TP"] for c in tr_metrics['cm']]),
                  "TN": np.mean([c["TN"] for c in tr_metrics['cm']]),
                  "FP": np.mean([c["FP"] for c in tr_metrics['cm']]),
@@ -443,12 +451,12 @@ with open('te_metrics.json', 'w') as f:
     f.write('\n')
     # line 3: the standard deviations
     f.write(json.dumps({'std': {
-        'acc':  np.std(acc_list),
-        'sens': np.std(sens_list),
-        'spec': np.std(spec_list),
-        'ppv':  np.std(ppv_list),
-        'npv':  np.std(npv_list),
-        'auc':  np.std(auc_list),
+        'acc':  np.std(tr_metrics['acc']),
+        'sens': np.std(tr_metrics['sens']),
+        'spec': np.std(tr_metrics['spec']),
+        'ppv':  np.std(tr_metrics['ppv']),
+        'npv':  np.std(tr_metrics['npv']),
+        'auc':  np.std(tr_metrics['auc']),
         'cm':   {"TP": np.std([c["TP"] for c in tr_metrics['cm']]),
                  "TN": np.std([c["TN"] for c in tr_metrics['cm']]),
                  "FP": np.std([c["FP"] for c in tr_metrics['cm']]),
@@ -485,44 +493,30 @@ with open('te_metrics.json', 'w') as f:
                  "FN": np.std([c["FN"] for c in te_metrics['cm']])}}}))
 
 
-# Plot 1: all 51 ROC curves on one figure
-plt.figure()
-specificity = 1 - fpr
-for i in range(n_runs):
-    plt.plot(1-fpr_list[i], tpr_list[i], color='blue', alpha=0.2)
-plt.plot([1, 0], [0, 1], 'r--')
-plt.xlim([1, 0])
-plt.ylim([0, 1])
-plt.xlabel('False Positive Rate')
-plt.ylabel('True Positive Rate')
-plt.title(f'All ROC Curves from {n_runs} Itertions of Outer-loop Nested CV')
-plt.savefig(
-    f'All_ROC_Curves_from_{n_runs}_Itertions_of_Outer-loop_Nested_CV.png')
-
-# Plot 2: the average ROC curve
-# Each run's curve has different points, so we can't average them directly.
-# We re-measure every curve on the same x-axis grid, then average the heights.
-mean_fpr = np.linspace(0, 1, 100)  # 100 shared x-axis points from 0 to 1
+# Combined plot: all individual runs (faint) + mean curve (bold) on one figure
+mean_fpr = np.linspace(0, 1, 100)   # 100 shared x-axis points
 tpr_interp_list = []
-
 for i in range(n_runs):
-    # re-measure on the grid
     interp_tpr = np.interp(mean_fpr, fpr_list[i], tpr_list[i])
-    interp_tpr[0] = 0.0  # force start at (0,0)
+    interp_tpr[0] = 0.0
     tpr_interp_list.append(interp_tpr)
-
-mean_tpr = np.mean(tpr_interp_list, axis=0)  # average height at each x point
-mean_tpr[-1] = 1.0                            # force end at (1,1)
+mean_tpr = np.mean(tpr_interp_list, axis=0)
+mean_tpr[-1] = 1.0
 mean_auc = auc(mean_fpr, mean_tpr)
 
 plt.figure()
-specificity = 1 - fpr
-plt.plot(1-mean_fpr, mean_tpr, 'b', label='Mean AUC = %0.6f' % mean_auc)
-plt.plot([1, 0], [0, 1], 'r--')
+for i in range(n_runs):
+    # label only the first faint curve, so the legend shows it just once
+    label = 'Individual runs' if i == 0 else None
+    plt.plot(1-fpr_list[i], tpr_list[i], color='blue', alpha=0.2, label=label)
+plt.plot(1-mean_fpr, mean_tpr, color='red', linewidth=2,
+         label='Mean AUC = %0.4f' % mean_auc)
+plt.plot([1, 0], [0, 1], 'k--', alpha=0.6)   # diagonal reference
 plt.xlim([1, 0])
 plt.ylim([0, 1])
 plt.xlabel('False Positive Rate')
 plt.ylabel('True Positive Rate')
-plt.title(f'Average ROC curve over {n_runs} runs')
+plt.title(f'ROC over {n_runs} runs (individual + mean)')
 plt.legend(loc='lower right')
-plt.savefig(f'Average_ROC_curve_over_{n_runs}_runs.png')
+plt.savefig(f'ROC_individual_and_mean_over_{n_runs}_runs.png')
+plt.close()
