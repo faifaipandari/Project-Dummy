@@ -149,6 +149,7 @@ def inner_k_fold_cv(df: pd.DataFrame, indices: list, k: int = 5, shuffle: bool =
     # 'PredefinedSplit' creates one fold for each distinct value it sees in the list we hand it.
     # So the number of folds is decided entirely by how many unique numbers end up in folds.
 
+
 def calculateMetrics(cm):
     metrics = {}
     if isinstance(cm, np.ndarray):
@@ -166,12 +167,13 @@ def calculateMetrics(cm):
 # creating our own function for the per-fold CV performance (2.1 in the outer-loop CV)
 
 def aucScoring(model, features, targets):
-# Gridsearch passes three things: model, features, and target to this function
-    probs = model.predict_proba(features) # getting probability of "C"
+    # Gridsearch passes three things: model, features, and target to this function
+    probs = model.predict_proba(features)  # getting probability of "C"
     # .class = pick the column that we want to use: "C"/nc column
     c_index = list(model.classes_).index("C")
     preds = probs[:, c_index]  # keep only 'C' as prob of c+nc = 1
-    targets = [1 if target == 'C' else 0 for target in targets] # converting labels to 0/1 and computing AUC
+    # converting labels to 0/1 and computing AUC
+    targets = [1 if target == 'C' else 0 for target in targets]
     return roc_auc_score(targets, preds)
 
 
@@ -184,7 +186,7 @@ scorer = {'auc': aucScoring,
 
 inner_cv = inner_k_fold_cv(df, training_indices)
 grid = GridSearchCV(rf, param_grid, cv=inner_cv,
-                    scoring=scorer, n_jobs=-1, refit = 'auc')
+                    scoring=scorer, n_jobs=-1, refit='auc')
 # rf = the estimator, param_grid = the hyperparameters to search, cv = the cross-validation strategy used to score each candidate,
 # scoring="roc_auc" to decide which hyperparameter combination is the best, n_jobs=1 do one job at a time,
 # refit=True to refit the best model on the whole training set after grid search.
@@ -196,17 +198,24 @@ grid.fit(getFeatures(df, training_indices), getTarget(df, training_indices))
 
 cv_metrics = []
 
-print(grid.best_score_)
+# which of the 27 combos won (the one with the highest mean AUC)
+best = grid.best_index_
 
-cm = {'tn': np.ndarray(np.mean(grid.cv_results_['split0_test_tn']), np.mean(grid.cv_results_['split1_test_tn']), np.mean(grid.cv_results_['split2_test_tn']), np.mean(grid.cv_results_['split3_test_tn']), np.mean(grid.cv_results_['split4_test_tn'])), 
-      'fp': np.ndarray(np.mean(grid.cv_results_['split0_test_fp']), np.mean(grid.cv_results_['split1_test_fp']), np.mean(grid.cv_results_['split2_test_fp']), np.mean(grid.cv_results_['split3_test_fp']), np.mean(grid.cv_results_['split4_test_fp'])), 
-      'fn': np.ndarray(np.mean(grid.cv_results_['split0_test_fn']), np.mean(grid.cv_results_['split1_test_fn']), np.mean(grid.cv_results_['split2_test_fn']), np.mean(grid.cv_results_['split3_test_fn']), np.mean(grid.cv_results_['split4_test_fn'])), 
-      'tp': np.ndarray(np.mean(grid.cv_results_['split0_test_tp']), np.mean(grid.cv_results_['split1_test_tp']), np.mean(grid.cv_results_['split2_test_tp']), np.mean(grid.cv_results_['split3_test_tp']), np.mean(grid.cv_results_['split4_test_tp']))}
+cm = {'tn': np.array([grid.cv_results_[f'split{k}_test_tn'][best] for k in range(5)]),
+      'fp': np.array([grid.cv_results_[f'split{k}_test_fp'][best] for k in range(5)]),
+      'fn': np.array([grid.cv_results_[f'split{k}_test_fn'][best] for k in range(5)]),
+      'tp': np.array([grid.cv_results_[f'split{k}_test_tp'][best] for k in range(5)])}
 metrics = calculateMetrics(cm)
 for metric in metrics:
     metrics[metric] = list(metrics[metric])
-metrics['roc_auc'] = list(grid.cv_results_['mean_test_auc'])
+metrics['roc_auc'] = [grid.cv_results_[
+    f'split{k}_test_auc'][best] for k in range(5)]
 cv_metrics.append(metrics)
+print("="*30)
+print()
+print("Best combo:", grid.best_params_,
+      "| mean AUC:", round(grid.best_score_, 3))
+print()
 
 # spread of the inner CV scores (across all fold evaluations)
 print("="*30)
@@ -261,7 +270,7 @@ tn, fp, fn, tp = cm.ravel()
 # SANITY CHECK: compare sklearn's accuracy_score with the manual formula
 manual_acc = (tp + tn) / (tp + tn + fp + fn)
 print(f"[check] sklearn acc={score:.6f}  manual acc={manual_acc:.6f}")
-print ()
+print()
 
 print("Dxcover clinical matrics:")
 print(f"Sensitivity (recall, C):  {tp/(tp+fn):.3f}")
@@ -308,7 +317,7 @@ print()
 # ===========================================
 
 # Set n = 51 for iterations
-n_runs = 51
+n_runs = 3
 
 # create empty lists to collect each run's results
 acc_list = []
