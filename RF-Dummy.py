@@ -106,42 +106,37 @@ Y_train = getTarget(df, training_indices)  # series of 'cnc'
 groups = df.loc[training_indices, 'pid']
 
 
-def inner_k_fold_cv(df: pd.DataFrame, indices: list, k: int = 5, shuffle: bool = True, random_state: int = 42):
-    # groupping the roq by patients ID (pid)
-    patients = []  # creating an empty dictionary that maps each patient's ID to a list of patient's row
-    # looping over every position in X, one row at a time (need to be position, not the orginal df label)
-    for position, idx in enumerate(getFeatures(df, indices).index):
-        # look up which patient this row belongs to   # FIX: do the lookup once
-        pid = df.loc[training_indices, 'pid'].loc[idx]
-        # if it has not yet seen the patient (new patient), open an empty list for it
-        if pid not in patients:
-            patients.append(pid)
+def inner_k_fold_cv(df, indices, k=5, shuffle=True, random_state=42):
+    # find each patient's label, using ONLY the rows in `indices`
+    # (this also fixes the bug of reading the global training_indices)
+    patient_label = {}
+    for idx in indices:
+        pid = df.loc[idx, 'pid']
+        if pid not in patient_label:
+            patient_label[pid] = df.loc[idx, 'cnc']   # one label per patient
 
-    # setting up the positions to shuffle and slice
-    n_patients = len(patients)  # count the number of patients
+    # separate patients by class, so each fold can get a share of both
+    c_patients = [pid for pid, lab in patient_label.items() if lab == 'C']
+    nc_patients = [pid for pid, lab in patient_label.items() if lab == 'NC']
 
-    # shuffle the position of patients in the list, not the rows
+    # shuffle each class separately (reproducible via the seed)
     if shuffle:
-        random.seed(random_state)  # shuffle with reproducible random seed
-        random.shuffle(patients)
+        random.seed(random_state)
+        random.shuffle(c_patients)
+        random.shuffle(nc_patients)
 
-    # divide the patients into 5 buckets
-    pid_folds = {}
-    for fold in range(k):  # we set k = 5
-        # check ** ends at 20, stats at 20 ** is it duplicated?
-        pid_folds[fold] = patients[int(
-            (n_patients / k) * fold):int((n_patients / k) * (fold + 1))]
-        # 5-folds are 0 (patient pid starts at 0: ends at 20), 1 (patient pid starts at 20: ends at 40), ...
+    # deal patients out round-robin: patient 0 -> fold 0, 1 -> fold 1, ... then wrap
+    # doing this per class guarantees every fold sees both C and NC
+    patient_fold = {}
+    for i, pid in enumerate(c_patients):
+        patient_fold[pid] = i % k
+    for i, pid in enumerate(nc_patients):
+        patient_fold[pid] = i % k
 
-    # turn patient-buckets into a per-row label list as 'PredefinedSplit' as it doesn't want patient buckets, it wants one fold number per row, in the same order as the data
-    folds = []
-    for index in indices:
-        pid = df.loc[index, 'pid']
-        for fold in pid_folds:
-            if pid in pid_folds[fold]:
-                folds.append(fold)
+    # turn that into one fold number per row, in the same order as `indices`
+    folds = [patient_fold[df.loc[index, 'pid']] for index in indices]
 
-    # SANITY CHECK: patient's label in the folds - only printed when mismatch
+    # SANITY CHECK: one label per row
     if len(indices) != len(folds):
         print("  WARNING: fold labelling mismatch!")
 
@@ -201,16 +196,16 @@ cv_metrics = []
 # which of the 27 combos won (the one with the highest mean AUC)
 best = grid.best_index_
 
-cm = {'tn': np.array([grid.cv_results_[f'split{k}_test_tn'][best] for k in range(5)]),
-      'fp': np.array([grid.cv_results_[f'split{k}_test_fp'][best] for k in range(5)]),
-      'fn': np.array([grid.cv_results_[f'split{k}_test_fn'][best] for k in range(5)]),
-      'tp': np.array([grid.cv_results_[f'split{k}_test_tp'][best] for k in range(5)])}
+cm = {m: np.array([grid.cv_results_[f'split{k}_test_{m}'][best] for k in range(5)])
+      for m in ['tn', 'fp', 'fn', 'tp']}
+
 metrics = calculateMetrics(cm)
 for metric in metrics:
     metrics[metric] = list(metrics[metric])
 metrics['roc_auc'] = [grid.cv_results_[
     f'split{k}_test_auc'][best] for k in range(5)]
 cv_metrics.append(metrics)
+
 print("="*30)
 print()
 print("Best combo:", grid.best_params_,
@@ -299,7 +294,7 @@ roc_auc = roc_auc_score(y_bin, preds)  # calculate AUC value
 
 # plot ROC curve
 specificity = 1 - fpr  # convert FPR -> Specificity
-plt.title('Receiver Operating Characteristic of the Inner-loop Nested CV')
+plt.title('Receiver Operating Characteristic of the single demonstration run')
 plt.plot(1-fpr, tpr, 'b', label='AUC = %0.6f' % roc_auc)
 plt.legend(loc='lower right')
 plt.plot([1, 0], [0, 1], 'r--')  # diagonal, now in spec space
@@ -307,7 +302,8 @@ plt.xlim([1, 0])  # 1.0 on left, 0.0 on right
 plt.ylim([0, 1])
 plt.ylabel('True Positive Rate')
 plt.xlabel('False Positive Rate')
-plt.savefig(f'Receiver_Operating_Characteristic_of_the_Inner-loop_Nested_CV.png')
+plt.savefig(
+    f'Receiver_Operating_Characteristic_of_the_Single_Demonstration_Run.png')
 print("="*30)
 print()
 
@@ -395,11 +391,9 @@ for i in range(n_runs):
         {"TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn)})
 
     # 5. the performance metrics
-    accuracy = accuracy_score(y_test, predicted)
-    sensitivity = tp / (tp + fn)
-    specificity = tn / (tn + fp)
-    ppv = tp / (tp + fp)
-    npv = tn / (tn + fn)
+    m = calculateMetrics(cm)
+    accuracy, sensitivity, specificity = m['acc'], m['sens'], m['spec']
+    ppv, npv = m['ppv'], m['npv']
 
     # 6. ROC curve + AUC
     probs = best_rf.predict_proba(getFeatures(df, testing_indices))
@@ -439,66 +433,34 @@ te_metrics = {'acc': acc_list, 'sens': sens_list, 'spec': spec_list,
               'ppv': ppv_list, 'npv': npv_list, 'auc': auc_list, 'cm': te_cm_list}
 
 # making separate .json files for training and testing
-# training file: raw per-run data + averages + stds
-with open('tr_metrics.json', 'w') as f:
-    f.write(json.dumps(tr_metrics))
-    f.write('\n')
-    # line 2: the averages (mean of each metric)
-    f.write(json.dumps({'average': {
-        'acc':  np.mean(tr_metrics['acc']),
-        'sens': np.mean(tr_metrics['sens']),
-        'spec': np.mean(tr_metrics['spec']),
-        'ppv':  np.mean(tr_metrics['ppv']),
-        'npv':  np.mean(tr_metrics['npv']),
-        'auc':  np.mean(tr_metrics['auc']),
-        'cm':   {"TP": np.mean([c["TP"] for c in tr_metrics['cm']]),
-                 "TN": np.mean([c["TN"] for c in tr_metrics['cm']]),
-                 "FP": np.mean([c["FP"] for c in tr_metrics['cm']]),
-                 "FN": np.mean([c["FN"] for c in tr_metrics['cm']])}}}))
-    f.write('\n')
-    # line 3: the standard deviations
-    f.write(json.dumps({'std': {
-        'acc':  np.std(tr_metrics['acc']),
-        'sens': np.std(tr_metrics['sens']),
-        'spec': np.std(tr_metrics['spec']),
-        'ppv':  np.std(tr_metrics['ppv']),
-        'npv':  np.std(tr_metrics['npv']),
-        'auc':  np.std(tr_metrics['auc']),
-        'cm':   {"TP": np.std([c["TP"] for c in tr_metrics['cm']]),
-                 "TN": np.std([c["TN"] for c in tr_metrics['cm']]),
-                 "FP": np.std([c["FP"] for c in tr_metrics['cm']]),
-                 "FN": np.std([c["FN"] for c in tr_metrics['cm']])}}}))
+# training and testing files: raw per-run data + averages + stds
 
-# test file: original line + averages line
-with open('te_metrics.json', 'w') as f:
-    f.write(json.dumps(te_metrics))
-    f.write('\n')
-    # line 2: the averages (mean of each metric)
-    f.write(json.dumps({'average': {
-        'acc':  np.mean(acc_list),
-        'sens': np.mean(sens_list),
-        'spec': np.mean(spec_list),
-        'ppv':  np.mean(ppv_list),
-        'npv':  np.mean(npv_list),
-        'auc':  np.mean(auc_list),
-        'cm':   {"TP": np.mean([c["TP"] for c in te_metrics['cm']]),
-                 "TN": np.mean([c["TN"] for c in te_metrics['cm']]),
-                 "FP": np.mean([c["FP"] for c in te_metrics['cm']]),
-                 "FN": np.mean([c["FN"] for c in te_metrics['cm']])}}}))
-    f.write('\n')
-    # line 3: the standard deviations
-    f.write(json.dumps({'std': {
-        'acc':  np.std(acc_list),
-        'sens': np.std(sens_list),
-        'spec': np.std(spec_list),
-        'ppv':  np.std(ppv_list),
-        'npv':  np.std(npv_list),
-        'auc':  np.std(auc_list),
-        'cm':   {"TP": np.std([c["TP"] for c in te_metrics['cm']]),
-                 "TN": np.std([c["TN"] for c in te_metrics['cm']]),
-                 "FP": np.std([c["FP"] for c in te_metrics['cm']]),
-                 "FN": np.std([c["FN"] for c in te_metrics['cm']])}}}))
+# define the function that will define the results
 
+
+def summarise(metrics, func):  # strat an empty dictionary that will return the results
+    out = {}
+    for k in ['acc', 'sens', 'spec', 'ppv', 'npv', 'auc']:
+        out[k] = func(metrics[k])
+    out['cm'] = {ck: func([c[ck] for c in metrics['cm']])  # define what we want as outputs
+                 for ck in ["TP", "TN", "FP", "FN"]}
+    return out
+
+# define the 'writing .json file' function
+
+
+def write_metrics_json(path, metrics):
+    with open(path, 'w') as f:
+        f.write(json.dumps(metrics))
+        f.write('\n')
+        f.write(json.dumps({'average': summarise(metrics, np.mean)}))
+        f.write('\n')
+        f.write(json.dumps({'std': summarise(metrics, np.std)}))
+
+
+# write the .json file for both tr_ and te_ metrics
+write_metrics_json('tr_metrics.json', tr_metrics)
+write_metrics_json('te_metrics.json', te_metrics)
 
 # Combined plot: all individual runs (faint) + mean curve (bold) on one figure
 mean_fpr = np.linspace(0, 1, 100)   # 100 shared x-axis points
