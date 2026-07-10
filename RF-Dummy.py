@@ -7,7 +7,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, roc_auc_score, roc_curve, confusion_matrix, auc, make_scorer
 from sklearn.model_selection import (
-    train_test_split, GridSearchCV, StratifiedKFold, PredefinedSplit)
+    train_test_split, GridSearchCV, PredefinedSplit)
 from sklearn.ensemble import RandomForestClassifier
 import random
 from copy import deepcopy
@@ -190,21 +190,33 @@ grid = GridSearchCV(rf, param_grid, cv=inner_cv,
 # inner CV picks the best params (from training set)
 grid.fit(getFeatures(df, training_indices), getTarget(df, training_indices))
 
+cv_metrics = []  # create an empty list
+# storing the length of the 27 permutation
+n_combos = len(grid.cv_results_['mean_test_auc'])
 
-cv_metrics = []
+for k in range(5):  # loop over each fold (split 0, 1, 2, 3, 4) -> one entry per fold
+    # this fold's AUC for every one of the 27 combos
+    combo_aucs = [grid.cv_results_[f'split{k}_test_auc'][c]
+                  for c in range(n_combos)]
+    # gathering the 27 per-combo AUCs (on this fold) into a list
 
-# which of the 27 combos won (the one with the highest mean AUC)
-best = grid.best_index_
+    # which combo scored highest ON THIS FOLD, and the AUC there
+    # return the position of the highest AUC in the list above
+    best_combo = int(np.argmax(combo_aucs))
+    # use that position to read the highest AUC
+    best_auc = combo_aucs[best_combo]
 
-cm = {m: np.array([grid.cv_results_[f'split{k}_test_{m}'][best] for k in range(5)])
-      for m in ['tn', 'fp', 'fn', 'tp']}
+    # confusion matrix for that winning combo, on this fold
+    cm = {m: grid.cv_results_[f'split{k}_test_{m}'][best_combo]
+          for m in ['tn', 'fp', 'fn', 'tp']}
+    metrics = calculateMetrics(cm)
 
-metrics = calculateMetrics(cm)
-for metric in metrics:
-    metrics[metric] = list(metrics[metric])
-metrics['roc_auc'] = [grid.cv_results_[
-    f'split{k}_test_auc'][best] for k in range(5)]
-cv_metrics.append(metrics)
+    metrics['split'] = k  # which fold this row is (0..4)
+    metrics['params'] = grid.cv_results_['params'][best_combo]
+    # which of the 27 combos won on this fold
+    metrics['best_combo'] = best_combo
+    metrics['roc_auc'] = best_auc
+    cv_metrics.append(metrics)
 
 print("="*30)
 print()
@@ -212,18 +224,39 @@ print("Best combo:", grid.best_params_,
       "| mean AUC:", round(grid.best_score_, 3))
 print()
 
-# spread of the inner CV scores (across all fold evaluations)
-print("="*30)
-print()
+# the numeric metrics we summarise (define this FIRST, both blocks use it)
+keys = ['acc', 'sens', 'spec', 'ppv', 'npv', 'roc_auc']
+
 print("Inner CV scores (mean ± std over", len(cv_metrics), "evaluations):")
-for key in ['acc', 'sens', 'spec', 'ppv', 'npv', 'roc_auc']:
-    # pull this metric out of every dict
+for key in keys:
     values = [m[key] for m in cv_metrics]
     print(f"  {key:8s} {np.mean(values):.3f} ± {np.std(values):.3f}")
 
+# average + std across the 27 combos
+cv_average = {key: np.mean([m[key] for m in cv_metrics]) for key in keys}
+cv_std = {key: np.std([m[key] for m in cv_metrics]) for key in keys}
+
 with open('cv_metrics.json', 'w') as f:
     f.write(json.dumps(cv_metrics))
+    f.write('\n')
+    f.write(json.dumps({'average': cv_average}))
+    f.write('\n')
+    f.write(json.dumps({'std': cv_std}))
 
+
+# confusion matrix + AUC for the best combo, one row per split
+best = grid.best_index_  # the mean-best combo's index
+print()
+print("Per-split results for the best combo:")
+print(f"{'split':>5} | {'TN':>4} {'FP':>4} {'FN':>4} {'TP':>4} | {'AUC':>6}")
+print("-"*36)
+for k in range(5):
+    tn = grid.cv_results_[f'split{k}_test_tn'][best]
+    fp = grid.cv_results_[f'split{k}_test_fp'][best]
+    fn = grid.cv_results_[f'split{k}_test_fn'][best]
+    tp = grid.cv_results_[f'split{k}_test_tp'][best]
+    auc_k = grid.cv_results_[f'split{k}_test_auc'][best]
+    print(f"{k:>5} | {tn:>4.0f} {fp:>4.0f} {fn:>4.0f} {tp:>4.0f} | {auc_k:>6.3f}")
 print()
 print("="*30)
 print()
@@ -313,7 +346,7 @@ print()
 # ===========================================
 
 # Set n = 51 for iterations
-n_runs = 3
+n_runs = 51
 
 # create empty lists to collect each run's results
 acc_list = []
