@@ -151,11 +151,16 @@ def calculateMetrics(cm):
         tn, fp, fn, tp = cm.ravel().tolist()
     else:
         tn, fp, fn, tp = cm['tn'], cm['fp'], cm['fn'], cm['tp']
-    metrics['acc'] = ((tp + tn) / (tp + fp + tn + fn))
-    metrics['sens'] = (tp / (tp + fn))
-    metrics['spec'] = (tn / (tn + fp))
-    metrics['ppv'] = (tp / (tp + fp))
-    metrics['npv'] = (tn / (tn + fn))
+
+    def safe_div(numerator, denominator):
+        # if the denominator is 0 the metric is undefined -> nan instead of a crash
+        return numerator / denominator if denominator else np.nan
+
+    metrics['acc'] = safe_div(tp + tn, tp + fp + tn + fn)
+    metrics['sens'] = safe_div(tp, tp + fn)
+    metrics['spec'] = safe_div(tn, tn + fp)
+    metrics['ppv'] = safe_div(tp, tp + fp)
+    metrics['npv'] = safe_div(tn, tn + fn)
     return metrics
 
 
@@ -230,11 +235,11 @@ keys = ['acc', 'sens', 'spec', 'ppv', 'npv', 'roc_auc']
 print("Inner CV scores (mean ± std over", len(cv_metrics), "evaluations):")
 for key in keys:
     values = [m[key] for m in cv_metrics]
-    print(f"  {key:8s} {np.mean(values):.3f} ± {np.std(values):.3f}")
+    print(f"  {key:8s} {np.nanmean(values):.3f} ± {np.nanstd(values):.3f}")
 
 # average + std across the 27 combos
-cv_average = {key: np.mean([m[key] for m in cv_metrics]) for key in keys}
-cv_std = {key: np.std([m[key] for m in cv_metrics]) for key in keys}
+cv_average = {key: np.nanmean([m[key] for m in cv_metrics]) for key in keys}
+cv_std = {key: np.nanstd([m[key] for m in cv_metrics]) for key in keys}
 
 with open('cv_metrics.json', 'w') as f:
     f.write(json.dumps(cv_metrics))
@@ -357,16 +362,16 @@ npv_list = []
 auc_list = []
 te_cm_list = []
 
-# create empty lists for per-fold validation
-per_fold_cm_list = []
-per_fold_auc_list = []
-
 tr_metrics = {'acc': [], 'sens': [],
               'spec': [], 'ppv': [], 'npv': [], 'auc': [], 'cm': []}
 
 # create empty lists to store each run's ROC curve points (for the plots)
 fpr_list = []
 tpr_list = []
+
+# create empty lists for per-fold validation
+# collect per-fold inner-CV metrics across all runs (51 runs × 5 folds)
+per_fold_metrics_list = []
 
 print(f"Running {n_runs} iterations")
 
@@ -388,9 +393,20 @@ for i in range(n_runs):
         criterion='gini', class_weight="balanced", random_state=i, n_jobs=-1)
     inner_cv = inner_k_fold_cv(df, training_indices, random_state=i)
     grid = GridSearchCV(rf, param_grid, cv=inner_cv,
-                        scoring="roc_auc", n_jobs=-1, refit=True)
+                        scoring=scorer, n_jobs=-1, refit='auc')
     grid.fit(getFeatures(df, training_indices),
              getTarget(df, training_indices))
+
+    # per-fold inner-CV metrics for the current run
+    best = grid.best_index_  # the mean-best hyperparameter combo
+    for k in range(5):  # 5 inner folds
+        cm_k = {m: grid.cv_results_[f'split{k}_test_{m}'][best]
+                for m in ['tn', 'fp', 'fn', 'tp']}
+        fold_m = calculateMetrics(cm_k)  # acc, sens, spec, ppv, npv
+        fold_m['roc_auc'] = grid.cv_results_[f'split{k}_test_auc'][best]
+        fold_m['run'] = i
+        fold_m['split'] = k
+        per_fold_metrics_list.append(fold_m)
 
     # 2.2. Get the training metrics
     best_rf = grid.best_estimator_
@@ -452,15 +468,32 @@ for i in range(n_runs):
 
 # Averages over all runs
 print()
-print(f"Averages over {n_runs} runs (mean ± std):")
-print(f"Accuracy:    {np.mean(acc_list):.3f} ± {np.std(acc_list):.3f}")
-print(f"Sensitivity: {np.mean(sens_list):.3f} ± {np.std(sens_list):.3f}")
-print(f"Specificity: {np.mean(spec_list):.3f} ± {np.std(spec_list):.3f}")
-print(f"PPV:         {np.mean(ppv_list):.3f} ± {np.std(ppv_list):.3f}")
-print(f"NPV:         {np.mean(npv_list):.3f} ± {np.std(npv_list):.3f}")
-print(f"AUC:         {np.mean(auc_list):.3f} ± {np.std(auc_list):.3f}")
+print(f"Accuracy:    {np.nanmean(acc_list):.3f} ± {np.nanstd(acc_list):.3f}")
+print(f"Sensitivity: {np.nanmean(sens_list):.3f} ± {np.nanstd(sens_list):.3f}")
+print(f"Specificity: {np.nanmean(spec_list):.3f} ± {np.nanstd(spec_list):.3f}")
+print(f"PPV:         {np.nanmean(ppv_list):.3f} ± {np.nanstd(ppv_list):.3f}")
+print(f"NPV:         {np.nanmean(npv_list):.3f} ± {np.nanstd(npv_list):.3f}")
+print(f"AUC:         {np.nanmean(auc_list):.3f} ± {np.nanstd(auc_list):.3f}")
 print()
 print("="*30)
+
+# inner-CV performance per fold, averaged over all runs
+print()
+print(f"Inner-CV per-fold performance (mean ± std over {n_runs} runs):")
+fold_keys = ['acc', 'sens', 'spec', 'ppv', 'npv', 'roc_auc']
+print(f"{'split':>5} | " + " | ".join(f"{key:>13}" for key in fold_keys))
+print("-" * 95)
+for k in range(5):
+    rows = [r for r in per_fold_metrics_list if r['split'] == k]
+    cells = []
+    for key in fold_keys:
+        vals = [r[key] for r in rows]
+        cells.append(f"{np.nanmean(vals):.3f}±{np.nanstd(vals):.3f}")
+    print(f"{k:>5} | " + " | ".join(f"{c:>13}" for c in cells))
+
+# optional: save the raw 255 rows
+with open('per_fold_metrics.json', 'w') as f:
+    f.write(json.dumps(per_fold_metrics_list))
 
 te_metrics = {'acc': acc_list, 'sens': sens_list, 'spec': spec_list,
               'ppv': ppv_list, 'npv': npv_list, 'auc': auc_list, 'cm': te_cm_list}
@@ -486,9 +519,9 @@ def write_metrics_json(path, metrics):
     with open(path, 'w') as f:
         f.write(json.dumps(metrics))
         f.write('\n')
-        f.write(json.dumps({'average': summarise(metrics, np.mean)}))
+        f.write(json.dumps({'average': summarise(metrics, np.nanmean)}))
         f.write('\n')
-        f.write(json.dumps({'std': summarise(metrics, np.std)}))
+        f.write(json.dumps({'std': summarise(metrics, np.nanstd)}))
 
 
 # write the .json file for both tr_ and te_ metrics
