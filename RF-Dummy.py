@@ -116,8 +116,8 @@ def inner_k_fold_cv(df, indices, k=5, shuffle=True, random_state=42):
             patient_label[pid] = df.loc[idx, 'cnc']   # one label per patient
 
     # separate patients by class, so each fold can get a share of both
-    c_patients = [pid for pid, lab in patient_label.items() if lab == 'C']
-    nc_patients = [pid for pid, lab in patient_label.items() if lab == 'NC']
+    c_patients = [pid for pid, lab in patient_label.items() if lab == '1']
+    nc_patients = [pid for pid, lab in patient_label.items() if lab == '0']
 
     # shuffle each class separately (reproducible via the seed)
     if shuffle:
@@ -166,23 +166,29 @@ def calculateMetrics(cm):
 
 # creating our own function for the per-fold CV performance (2.1 in the outer-loop CV)
 
+validation_proba_predicts = []
+
+
 def aucScoring(model, features, targets):
+    global validation_proba_predicts
     # Gridsearch passes three things: model, features, and target to this function
     probs = model.predict_proba(features)  # getting probability of "C"
+    validation_proba_predicts.append(
+        {'predictions': probs, 'targets': targets})
     # .class = pick the column that we want to use: "C"/nc column
-    c_index = list(model.classes_).index("C")
+    c_index = list(model.classes_).index("1")
     preds = probs[:, c_index]  # keep only 'C' as prob of c+nc = 1
     # converting labels to 0/1 and computing AUC
-    targets = [1 if target == 'C' else 0 for target in targets]
+    targets = list(targets)
     return roc_auc_score(targets, preds)
 
 
 # searching the best method
 scorer = {'auc': aucScoring,
-          'tn': make_scorer(lambda yt, yp: confusion_matrix(yt, yp, labels=["NC", "C"])[0, 0]),
-          'fp': make_scorer(lambda yt, yp: confusion_matrix(yt, yp, labels=["NC", "C"])[0, 1]),
-          'fn': make_scorer(lambda yt, yp: confusion_matrix(yt, yp, labels=["NC", "C"])[1, 0]),
-          'tp': make_scorer(lambda yt, yp: confusion_matrix(yt, yp, labels=["NC", "C"])[1, 1])}
+          'tn': make_scorer(lambda yt, yp: confusion_matrix(yt, yp, labels=["0", "1"])[0, 0]),
+          'fp': make_scorer(lambda yt, yp: confusion_matrix(yt, yp, labels=["0", "1"])[0, 1]),
+          'fn': make_scorer(lambda yt, yp: confusion_matrix(yt, yp, labels=["0", "1"])[1, 0]),
+          'tp': make_scorer(lambda yt, yp: confusion_matrix(yt, yp, labels=["0", "1"])[1, 1])}
 
 inner_cv = inner_k_fold_cv(df, training_indices)
 grid = GridSearchCV(rf, param_grid, cv=inner_cv,
@@ -282,7 +288,7 @@ print()
 
 # 8. Confusion matrix on the test set
 cm = confusion_matrix(
-    getTarget(df, testing_indices), predicted, labels=["NC", "C"])
+    getTarget(df, testing_indices), predicted, labels=["0", "1"])
 cm_df = pd.DataFrame(cm,
                      index=["True NC", "True C"],
                      columns=["Predicted NC", "Predicted C"])
@@ -323,11 +329,11 @@ y_test = getTarget(df, testing_indices)
 # .predict_proba get the model confidence score of the column (C/NC) as probability per patient
 probs = best_rf.predict_proba(X_test)
 # .class = pick the column that we want to use: "C"/nc column
-c_index = list(best_rf.classes_).index("C")
+c_index = list(best_rf.classes_).index("1")
 preds = probs[:, c_index]  # keep only 'C' as prob of c+nc = 1
 fpr, tpr, threshold = roc_curve(
-    y_test, preds, pos_label="C")  # build the ROC curve
-y_bin = [1 if y == "C" else 0 for y in y_test]   # C -> 1, NC -> 0
+    y_test, preds, pos_label="1")  # build the ROC curve
+y_bin = list(y_test)
 roc_auc = roc_auc_score(y_bin, preds)  # calculate AUC value
 
 # plot ROC curve
@@ -412,7 +418,7 @@ for i in range(n_runs):
     best_rf = grid.best_estimator_
     predicted = best_rf.predict(getFeatures(df, training_indices))
     y_test = getTarget(df, training_indices)
-    cm = confusion_matrix(y_test, predicted, labels=["NC", "C"])
+    cm = confusion_matrix(y_test, predicted, labels=["0", "1"])
     tn, fp, fn, tp = cm.ravel()
     tr_metrics['cm'].append(
         {"TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn)})
@@ -422,10 +428,10 @@ for i in range(n_runs):
     tr_metrics['ppv'].append(tp / (tp + fp))
     tr_metrics['npv'].append(tn / (tn + fn))
     probs = best_rf.predict_proba(getFeatures(df, training_indices))
-    c_index = list(best_rf.classes_).index("C")
+    c_index = list(best_rf.classes_).index("1")
     preds = probs[:, c_index]
-    fpr, tpr, threshold = roc_curve(y_test, preds, pos_label="C")
-    y_bin = [1 if y == "C" else 0 for y in y_test]
+    fpr, tpr, threshold = roc_curve(y_test, preds, pos_label="1")
+    y_bin = list(y_test)
     tr_metrics['auc'].append(roc_auc_score(y_bin, preds))
 
     # 3. predict on this run's test set
@@ -434,7 +440,7 @@ for i in range(n_runs):
     y_test = getTarget(df, testing_indices)
 
     # 4. confusion matrix -> TN, FP, FN, TP
-    cm = confusion_matrix(y_test, predicted, labels=["NC", "C"])
+    cm = confusion_matrix(y_test, predicted, labels=["0", "1"])
     tn, fp, fn, tp = cm.ravel()
     te_cm_list.append(
         {"TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn)})
@@ -446,10 +452,10 @@ for i in range(n_runs):
 
     # 6. ROC curve + AUC
     probs = best_rf.predict_proba(getFeatures(df, testing_indices))
-    c_index = list(best_rf.classes_).index("C")
+    c_index = list(best_rf.classes_).index("1")
     preds = probs[:, c_index]
-    fpr, tpr, threshold = roc_curve(y_test, preds, pos_label="C")
-    y_bin = [1 if y == "C" else 0 for y in y_test]
+    fpr, tpr, threshold = roc_curve(y_test, preds, pos_label="1")
+    y_bin = list(y_test)
     roc_auc = roc_auc_score(y_bin, preds)
 
     # 7. save everything from this run
@@ -490,7 +496,7 @@ for k in range(5):
         vals = [r[key] for r in rows]
         cells.append(f"{np.nanmean(vals):.3f}±{np.nanstd(vals):.3f}")
     print(f"{k:>5} | " + " | ".join(f"{c:>13}" for c in cells))
-
+print()
 # optional: save the raw 255 rows
 with open('per_fold_metrics.json', 'w') as f:
     f.write(json.dumps(per_fold_metrics_list))
