@@ -14,7 +14,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, roc_auc_score, roc_curve, confusion_matrix, auc, make_scorer
 from sklearn.model_selection import (
-    train_test_split, GridSearchCV, PredefinedSplit)
+    train_test_split, GridSearchCV, PredefinedSplit, cross_val_predict)
 from sklearn.cross_decomposition import PLSRegression
 from sklearn.base import BaseEstimator, ClassifierMixin
 import random
@@ -54,7 +54,7 @@ class PLSDAClassifier(BaseEstimator, ClassifierMixin):
     def predict(self, X):
         # apply the threshold: high score -> "C", low score -> "NC"
         scores = self.decision_score(X)
-        return np.array([1 if s >= self.threshold else 0 for s in scores])
+        return np.array(["1" if s >= self.threshold else "0" for s in scores])
 
     def predict_proba(self, X):
         # NOTE: these are PLS scores, not the true probabilities; therefore, they can go slightly outside 0–1).
@@ -144,7 +144,7 @@ def split(data: pd.DataFrame, training_size: float = 0.7, shuffle: bool = True, 
 
 
 # 2. Using the features information to predict C/NC
-df = pd.read_csv("Dummy.csv")
+df = pd.read_csv("Dummy.csv", dtype={'cnc': str})
 features = [f"X_{i}" for i in range(1, 10)]
 
 
@@ -159,7 +159,7 @@ training_indices, testing_indices = split(df)  # Previous function in step 1.
 # We have 9 features (X_1–X_9), so we try 1..9 components.
 pls = PLSDAClassifier()
 param_grid = {
-    "n_components": [1, 2, 3, 4, 5, 6, 7, 8, 9], #1-->31
+    "n_components": [1, 2, 3, 4, 5, 6, 7, 8, 9],  # 1-->31
 }
 
 # 5. Nested cross-validation (run on the TRAINING set)
@@ -229,19 +229,38 @@ def calculateMetrics(cm):
     metrics['npv'] = safe_div(tn, tn + fn)
     return metrics
 
+# helper funtions for thresholding
+
+
+def to_binary(labels, positive="1"):
+    return np.array([1 if str(v) == positive else 0 for v in labels])
+
+
+def find_best_threshold(proba_c, y_true_binary, step=0.01):
+    best_threshold, best_bal_acc = 0.5, -1.0
+    lo = min(0.0, float(np.min(proba_c)))       # PLS scores can dip below 0
+    hi = max(1.0, float(np.max(proba_c)))       # and rise above 1
+    for t in np.arange(lo, hi + step, step):
+        preds = (proba_c > t).astype(int)
+        tp = int(np.sum((preds == 1) & (y_true_binary == 1)))
+        tn = int(np.sum((preds == 0) & (y_true_binary == 0)))
+        fp = int(np.sum((preds == 1) & (y_true_binary == 0)))
+        fn = int(np.sum((preds == 0) & (y_true_binary == 1)))
+        sens = tp / (tp + fn) if (tp + fn) else 0.0
+        spec = tn / (tn + fp) if (tn + fp) else 0.0
+        bal_acc = (sens + spec) / 2
+        if bal_acc > best_bal_acc:
+            best_bal_acc, best_threshold = bal_acc, round(float(t), 2)
+    return best_threshold, best_bal_acc
 
 # creating our own function for the per-fold CV performance (2.1 in the outer-loop CV)
 
+
 def aucScoring(model, features, targets):
-    # Gridsearch passes three things: model, features, and target to this function
-    probs = model.predict_proba(features)  # getting score for "C"
-    # .class = pick the column that we want to use: "C"/nc column
+    probs = model.predict_proba(features)
     c_index = list(model.classes_).index("1")
-    # keep only the 'C' score (used for ranking -> AUC)
     preds = probs[:, c_index]
-    # converting labels to 0/1 and computing AUC
-    targets = list(targets)
-    return roc_auc_score(targets, preds)
+    return roc_auc_score(to_binary(targets), preds)
 
 
 # searching the best method
@@ -333,13 +352,24 @@ print()
 print("="*30)
 print()
 print("Best hyperparameters:", grid.best_params_)
-predicted = grid.best_estimator_.predict(getFeatures(df, testing_indices))
+best_pls = grid.best_estimator_
+c_index = list(best_pls.classes_).index("1")
+val_proba = cross_val_predict(best_pls,
+                              getFeatures(df, training_indices),
+                              getTarget(df, training_indices),
+                              cv=inner_cv, method='predict_proba')[:, c_index]
+best_threshold, best_bal = find_best_threshold(
+    val_proba, to_binary(getTarget(df, training_indices)))
+print(
+    f"Chosen threshold: {best_threshold}  (balanced acc on validation = {best_bal:.3f})")
+# <-- PLS-specific: hand the threshold to the wrapper
+best_pls.threshold = best_threshold
+predicted = best_pls.predict(getFeatures(df, testing_indices))
 
 # 7. Report performance on the test set
 print()
 
 # VIP scores (the PLS replacement for RF's Gini importance)
-best_pls = grid.best_estimator_
 vip_scores = vip(best_pls.pls_)
 importance_table = pd.DataFrame(
     {"VIP": vip_scores}, index=features
@@ -392,7 +422,6 @@ y_test = getTarget(df, testing_indices)
 # .predict_proba gives the PLS score of the "C" column per patient (used for ranking)
 probs = best_pls.predict_proba(X_test)
 # .class = pick the column that we want to use: "C"/nc column
-c_index = list(best_pls.classes_).index("1")
 preds = probs[:, c_index]  # keep only the 'C' score
 fpr, tpr, threshold = roc_curve(
     y_test, preds, pos_label="1")  # build the ROC curve
@@ -476,8 +505,18 @@ for i in range(n_runs):
         fold_m['split'] = k
         per_fold_metrics_list.append(fold_m)
 
-    # 2.2. Get the training metrics
+    # find the optimum threshold once per run, then hand it to the wrapper
     best_pls = grid.best_estimator_
+    c_index = list(best_pls.classes_).index("1")
+    val_proba = cross_val_predict(best_pls,
+                                  getFeatures(df, training_indices),
+                                  getTarget(df, training_indices),
+                                  cv=inner_cv, method='predict_proba')[:, c_index]
+    best_threshold, _ = find_best_threshold(
+        val_proba, to_binary(getTarget(df, training_indices)))
+    best_pls.threshold = best_threshold
+
+    # 2.2. Get the training metrics
     predicted = best_pls.predict(getFeatures(df, training_indices))
     y_test = getTarget(df, training_indices)
     cm = confusion_matrix(y_test, predicted, labels=["0", "1"])
@@ -490,14 +529,12 @@ for i in range(n_runs):
     tr_metrics['ppv'].append(tp / (tp + fp))
     tr_metrics['npv'].append(tn / (tn + fn))
     probs = best_pls.predict_proba(getFeatures(df, training_indices))
-    c_index = list(best_pls.classes_).index("1")
     preds = probs[:, c_index]
     fpr, tpr, threshold = roc_curve(y_test, preds, pos_label="1")
     y_bin = list(y_test)
     tr_metrics['auc'].append(roc_auc_score(y_bin, preds))
 
     # 3. predict on this run's test set
-    best_pls = grid.best_estimator_
     predicted = best_pls.predict(getFeatures(df, testing_indices))
     y_test = getTarget(df, testing_indices)
 
@@ -514,7 +551,6 @@ for i in range(n_runs):
 
     # 6. ROC curve + AUC
     probs = best_pls.predict_proba(getFeatures(df, testing_indices))
-    c_index = list(best_pls.classes_).index("1")
     preds = probs[:, c_index]
     fpr, tpr, threshold = roc_curve(y_test, preds, pos_label="1")
     y_bin = list(y_test)
@@ -559,7 +595,7 @@ for k in range(5):
         cells.append(f"{np.nanmean(vals):.3f}±{np.nanstd(vals):.3f}")
     print(f"{k:>5} | " + " | ".join(f"{c:>13}" for c in cells))
 
-# optional: save the raw 255 rows
+# save the raw rows
 with open('per_fold_metrics.json', 'w') as f:
     f.write(json.dumps(per_fold_metrics_list))
 
