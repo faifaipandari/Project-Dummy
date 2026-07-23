@@ -8,8 +8,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, roc_auc_score, roc_curve, confusion_matrix, auc, make_scorer
 from sklearn.model_selection import (
-    train_test_split, GridSearchCV, PredefinedSplit)
-# [KNN] swap RandomForestClassifier -> KNeighborsClassifier, and add scaling tools
+    train_test_split, GridSearchCV, PredefinedSplit, cross_val_predict)
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
@@ -71,7 +70,7 @@ def split(data: pd.DataFrame, training_size: float = 0.7, shuffle: bool = True, 
 
 
 # 2. Using the features information to predict C/NC
-df = pd.read_csv("Dummy.csv")
+df = pd.read_csv("Dummy.csv", dtype={'cnc': str})
 features = [f"X_{i}" for i in range(1, 10)]
 
 
@@ -154,14 +153,36 @@ def calculateMetrics(cm):
     metrics['npv'] = safe_div(tn, tn + fn)
     return metrics
 
+# helper functions
+
+
+def to_binary(labels, positive="1"):
+    return np.array([1 if str(v) == positive else 0 for v in labels])
+
+
+def find_best_threshold(proba_c, y_true_binary, step=0.01):
+    best_threshold, best_bal_acc = 0.5, -1.0
+    for t in np.arange(0.0, 1.0 + step, step):
+        preds = (proba_c > t).astype(int)
+        tp = int(np.sum((preds == 1) & (y_true_binary == 1)))
+        tn = int(np.sum((preds == 0) & (y_true_binary == 0)))
+        fp = int(np.sum((preds == 1) & (y_true_binary == 0)))
+        fn = int(np.sum((preds == 0) & (y_true_binary == 1)))
+        sens = tp / (tp + fn) if (tp + fn) else 0.0
+        spec = tn / (tn + fp) if (tn + fp) else 0.0
+        bal_acc = (sens + spec) / 2
+        if bal_acc > best_bal_acc:
+            best_bal_acc, best_threshold = bal_acc, round(float(t), 2)
+    return best_threshold, best_bal_acc
 
 # our own AUC scorer for the inner CV
+
+
 def aucScoring(model, features, targets):
-    probs = model.predict_proba(features)         # probability per patient
-    c_index = list(model.classes_).index("1")     # pick the 'C' column
+    probs = model.predict_proba(features)
+    c_index = list(model.classes_).index("1")
     preds = probs[:, c_index]
-    targets = list(targets)
-    return roc_auc_score(targets, preds)
+    return roc_auc_score(to_binary(targets), preds)
 
 
 # multi-metric scorer: AUC decides the winner, the rest give us the confusion matrix per fold
@@ -242,13 +263,25 @@ print()
 print("="*30)
 print()
 print("Best hyperparameters:", grid.best_params_)
-predicted = grid.best_estimator_.predict(getFeatures(df, testing_indices))
 
-# 7. Report performance on the test set
-print()
-
-# [KNN] NO feature importances: KNN has no `feature_importances_` (RF's Gini section is removed).
+# prediction with our own threshold
 best_knn = grid.best_estimator_
+c_index = list(best_knn.classes_).index("1")
+val_proba = cross_val_predict(best_knn,
+                              getFeatures(df, training_indices),
+                              getTarget(df, training_indices),
+                              cv=inner_cv, method='predict_proba')[:, c_index]
+best_threshold, best_bal = find_best_threshold(
+    val_proba, to_binary(getTarget(df, training_indices)))
+print(
+    f"Chosen threshold: {best_threshold}  (balanced acc on validation = {best_bal:.3f})")
+predicted = np.where(
+    best_knn.predict_proba(getFeatures(df, testing_indices))[
+        :, c_index] > best_threshold,
+    "1", "0")
+
+# 7. Report performance on the test set (none in KNN)
+print()
 
 # 8. Confusion matrix on the test set
 cm = confusion_matrix(
@@ -266,7 +299,7 @@ print(f"Accuracy: {score:.3f}")
 print()
 
 # 9. Dxcover clinical metrics
-# With labels=["NC","C"], the matrix is [[TN, FP], [FN, TP]].
+# With labels= "0","1"], the matrix is [[TN, FP], [FN, TP]].
 tn, fp, fn, tp = cm.ravel()
 
 # SANITY CHECK: compare sklearn's accuracy_score with the manual formula
@@ -370,9 +403,21 @@ for i in range(n_runs):
         fold_m['split'] = k
         per_fold_metrics_list.append(fold_m)
 
-    # 2.2. training metrics
+    # find the optimum threshold once per run
     best_knn = grid.best_estimator_
-    predicted = best_knn.predict(getFeatures(df, training_indices))
+    c_index = list(best_knn.classes_).index("1")
+    val_proba = cross_val_predict(best_knn,
+                                  getFeatures(df, training_indices),
+                                  getTarget(df, training_indices),
+                                  cv=inner_cv, method='predict_proba')[:, c_index]
+    best_threshold, _ = find_best_threshold(
+        val_proba, to_binary(getTarget(df, training_indices)))
+
+    # 2.2. training metrics
+    predicted = np.where(
+        best_knn.predict_proba(getFeatures(df, training_indices))[
+            :, c_index] > best_threshold,
+        "1", "0")
     y_test = getTarget(df, training_indices)
     cm = confusion_matrix(y_test, predicted, labels=["0", "1"])
     tn, fp, fn, tp = cm.ravel()
@@ -384,15 +429,16 @@ for i in range(n_runs):
     tr_metrics['ppv'].append(tp / (tp + fp))
     tr_metrics['npv'].append(tn / (tn + fn))
     probs = best_knn.predict_proba(getFeatures(df, training_indices))
-    c_index = list(best_knn.classes_).index("1")
     preds = probs[:, c_index]
     fpr, tpr, threshold = roc_curve(y_test, preds, pos_label="1")
     y_bin = list(y_test)
     tr_metrics['auc'].append(roc_auc_score(y_bin, preds))
 
     # 3. predict on this run's test set
-    best_knn = grid.best_estimator_
-    predicted = best_knn.predict(getFeatures(df, testing_indices))
+    predicted = np.where(
+        best_knn.predict_proba(getFeatures(df, testing_indices))[
+            :, c_index] > best_threshold,
+        "1", "0")
     y_test = getTarget(df, testing_indices)
 
     # 4. confusion matrix -> TN, FP, FN, TP
@@ -408,7 +454,6 @@ for i in range(n_runs):
 
     # 6. ROC curve + AUC
     probs = best_knn.predict_proba(getFeatures(df, testing_indices))
-    c_index = list(best_knn.classes_).index("1")
     preds = probs[:, c_index]
     fpr, tpr, threshold = roc_curve(y_test, preds, pos_label="1")
     y_bin = list(y_test)
