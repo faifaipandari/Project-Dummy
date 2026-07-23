@@ -7,7 +7,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, roc_auc_score, roc_curve, confusion_matrix, auc, make_scorer
 from sklearn.model_selection import (
-    train_test_split, GridSearchCV, PredefinedSplit)
+    train_test_split, GridSearchCV, PredefinedSplit, cross_val_predict)
 from sklearn.ensemble import RandomForestClassifier
 import random
 from copy import deepcopy
@@ -75,7 +75,7 @@ def split(data: pd.DataFrame, training_size: float = 0.7, shuffle: bool = True, 
 
 
 # 2. Using the features information to predict C/NC
-df = pd.read_csv("Dummy.csv")
+df = pd.read_csv("Dummy.csv", dtype={'cnc': str})
 features = [f"X_{i}" for i in range(1, 10)]
 
 
@@ -162,25 +162,49 @@ def calculateMetrics(cm):
     metrics['ppv'] = safe_div(tp, tp + fp)
     metrics['npv'] = safe_div(tn, tn + fn)
     return metrics
-
-
 # creating our own function for the per-fold CV performance (2.1 in the outer-loop CV)
 
-validation_proba_predicts = []
+# labels for thresholding
+
+
+def to_binary(labels, positive="1"):  # converting label 0/1 into real 0/1 number
+    # walk through all the labels and note the "1"
+    return np.array([1 if str(v) == positive else 0 for v in labels])
+
+# takes the "c" probabilities and the true answers, then returns the best cut-off point
+
+
+def find_best_threshold(proba_c, y_true_binary, step=0.01):
+    # starting point (current = 0.5, the score that the current best treshold = start from -1.0)
+    best_threshold, best_bal_acc = 0.5, -1.0
+    # try every cut from 0.0 to 1.0 with step of 0.01
+    for t in np.arange(0.0, 1.0 + step, step):
+        # 2.1 see whether this cut off is C or NC
+        preds = (proba_c > t).astype(int)
+        # 2.2 confusion metric
+        tp = int(np.sum((preds == 1) & (y_true_binary == 1)))
+        tn = int(np.sum((preds == 0) & (y_true_binary == 0)))
+        fp = int(np.sum((preds == 1) & (y_true_binary == 0)))
+        fn = int(np.sum((preds == 0) & (y_true_binary == 1)))
+
+        # using the treshold of acc (sen+spec/2)
+        sens = tp / (tp + fn) if (tp + fn) else 0.0
+        spec = tn / (tn + fp) if (tn + fp) else 0.0
+        bal_acc = (sens + spec) / 2
+
+        # 2.3 tidy the decimals
+        if bal_acc > best_bal_acc:                              # 3.
+            best_bal_acc, best_threshold = bal_acc, round(float(t), 2)
+    return best_threshold, best_bal_acc
 
 
 def aucScoring(model, features, targets):
-    global validation_proba_predicts
-    # Gridsearch passes three things: model, features, and target to this function
-    probs = model.predict_proba(features)  # getting probability of "C"
-    validation_proba_predicts.append(
-        {'predictions': probs, 'targets': targets})
-    # .class = pick the column that we want to use: "C"/nc column
-    c_index = list(model.classes_).index("1")
-    preds = probs[:, c_index]  # keep only 'C' as prob of c+nc = 1
-    # converting labels to 0/1 and computing AUC
-    targets = list(targets)
-    return roc_auc_score(targets, preds)
+    # ask the model how confident is the prediction (0/1) and return the probability
+    probs = model.predict_proba(features)
+    c_index = list(model.classes_).index("1")  # find the column labelled "1"
+    preds = probs[:, c_index]  # exclude the NC column, only keeping the C
+    # compare true answers against the probabilities and return the AUC
+    return roc_auc_score(to_binary(targets), preds)
 
 
 # searching the best method
@@ -272,13 +296,27 @@ print()
 print("="*30)
 print()
 print("Best hyperparameters:", grid.best_params_)
-predicted = grid.best_estimator_.predict(getFeatures(df, testing_indices))
+
+# prediction of own own threshold
+best_rf = grid.best_estimator_
+c_index = list(best_rf.classes_).index("1")
+val_proba = cross_val_predict(best_rf,  # return the 5-fold split but instead of the score, it returns predictions
+                              getFeatures(df, training_indices),
+                              getTarget(df, training_indices),
+                              cv=inner_cv, method='predict_proba')[:, c_index]
+best_threshold, best_bal = find_best_threshold(  # feed the honest probability and the true answer to find the best cut off
+    val_proba, to_binary(getTarget(df, training_indices)))
+print(
+    f"Chosen threshold: {best_threshold}  (balanced acc on validation = {best_bal:.3f})")
+predicted = np.where(  # get the probability for the test set
+    best_rf.predict_proba(getFeatures(df, testing_indices))[
+        :, c_index] > best_threshold,
+    "1", "0")
 
 # 7. Report performance on the test set
 print()
 
 # Gini importance
-best_rf = grid.best_estimator_
 importance_table = pd.DataFrame(
     {"Importance": best_rf.feature_importances_}, index=features
 )
@@ -303,7 +341,7 @@ print(f"Accuracy: {score:.3f}")
 print()
 
 # 9. Dxcover clinical matrics
-# With labels=["NC","C"], the matrix is [[TN, FP], [FN, TP]].
+# With labels=["0","1"], the matrix is [[TN, FP], [FN, TP]].
 tn, fp, fn, tp = cm.ravel()
 
 # SANITY CHECK: compare sklearn's accuracy_score with the manual formula
@@ -316,6 +354,8 @@ print(f"Sensitivity (recall, C):  {tp/(tp+fn):.3f}")
 print(f"Specificity (recall, NC): {tn/(tn+fp):.3f}")
 print(f"PPV:                      {tp/(tp+fp):.3f}")
 print(f"NPV:                      {tn/(tn+fn):.3f}")
+print(
+    f"[threshold {best_threshold}] Sens {tp/(tp+fn):.3f} / Spec {tn/(tn+fp):.3f}")
 print()
 
 # ROC curve
@@ -328,8 +368,6 @@ y_test = getTarget(df, testing_indices)
 # calculate the fpr (false positive rate) and tpr (true positive rate) for all thresholds
 # .predict_proba get the model confidence score of the column (C/NC) as probability per patient
 probs = best_rf.predict_proba(X_test)
-# .class = pick the column that we want to use: "C"/nc column
-c_index = list(best_rf.classes_).index("1")
 preds = probs[:, c_index]  # keep only 'C' as prob of c+nc = 1
 fpr, tpr, threshold = roc_curve(
     y_test, preds, pos_label="1")  # build the ROC curve
@@ -414,9 +452,21 @@ for i in range(n_runs):
         fold_m['split'] = k
         per_fold_metrics_list.append(fold_m)
 
-    # 2.2. Get the training metrics
+    # find the optimum threshold once per run
     best_rf = grid.best_estimator_
-    predicted = best_rf.predict(getFeatures(df, training_indices))
+    c_index = list(best_rf.classes_).index("1")
+    val_proba = cross_val_predict(best_rf,
+                                  getFeatures(df, training_indices),
+                                  getTarget(df, training_indices),
+                                  cv=inner_cv, method='predict_proba')[:, c_index]
+    best_threshold, _ = find_best_threshold(
+        val_proba, to_binary(getTarget(df, training_indices)))
+
+    # 2.2. Get the training metrics
+    predicted = np.where(
+        best_rf.predict_proba(getFeatures(df, training_indices))[
+            :, c_index] > best_threshold,
+        "1", "0")  # new threshold
     y_test = getTarget(df, training_indices)
     cm = confusion_matrix(y_test, predicted, labels=["0", "1"])
     tn, fp, fn, tp = cm.ravel()
@@ -428,15 +478,16 @@ for i in range(n_runs):
     tr_metrics['ppv'].append(tp / (tp + fp))
     tr_metrics['npv'].append(tn / (tn + fn))
     probs = best_rf.predict_proba(getFeatures(df, training_indices))
-    c_index = list(best_rf.classes_).index("1")
     preds = probs[:, c_index]
     fpr, tpr, threshold = roc_curve(y_test, preds, pos_label="1")
     y_bin = list(y_test)
     tr_metrics['auc'].append(roc_auc_score(y_bin, preds))
 
     # 3. predict on this run's test set
-    best_rf = grid.best_estimator_
-    predicted = best_rf.predict(getFeatures(df, testing_indices))
+    predicted = np.where(
+        best_rf.predict_proba(getFeatures(df, testing_indices))[
+            :, c_index] > best_threshold,
+        "1", "0")  # new threshold
     y_test = getTarget(df, testing_indices)
 
     # 4. confusion matrix -> TN, FP, FN, TP
@@ -452,7 +503,6 @@ for i in range(n_runs):
 
     # 6. ROC curve + AUC
     probs = best_rf.predict_proba(getFeatures(df, testing_indices))
-    c_index = list(best_rf.classes_).index("1")
     preds = probs[:, c_index]
     fpr, tpr, threshold = roc_curve(y_test, preds, pos_label="1")
     y_bin = list(y_test)
@@ -469,7 +519,7 @@ for i in range(n_runs):
     tpr_list.append(tpr)
 
     # 8. print this run's row in the "sheet"
-    print(f"Run {i+1:2d} | Acc {accuracy:.3f} | Sens {sensitivity:.3f} | "
+    print(f"Run {i+1:2d} | thr {best_threshold:.2f} | Acc {accuracy:.3f} | Sens {sensitivity:.3f} | "
           f"Spec {specificity:.3f} | PPV {ppv:.3f} | NPV {npv:.3f} | AUC {roc_auc:.3f}")
 
 # Averages over all runs
